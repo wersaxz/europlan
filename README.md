@@ -1,23 +1,13 @@
 # europlan
-europlan
-
-
-ну вот пример
-ufn bn
-drop table if exists #NegativeClient
-select
-    CR.phone
-    ,CR.status
-into #NegativeClient
-from
-    WarehousePG.voipclient_leasing_task T
-    join WarehousePG.voipclient_leasing_interaction I
-        on I.task = T.id
-    right join #Call C
-        on C.contact = I.contact and C.CallStarted is not null
-    join WarehousePG.voipclient_leasing_call_result CR
-        on CR.call_id = C.id
-        and CR.[status] in (67, 310)
-group by
-    CR.phone
-    ,CR.status
+SELECT DISTINCT
+    BL.PhoneNumber,
+    T.cta_repository_id
+FROM [Custom].[BlackList_ToInsert] BL
+JOIN WarehousePG.voipclient_leasing_call_result CR
+    ON CR.phone = BL.PhoneNumber
+JOIN WarehousePG.voipclient_leasing_interaction I
+    ON I.id = CR.interaction
+JOIN WarehousePG.voipclient_leasing_task T
+    ON T.id = I.task
+WHERE BL.InsertReason IN ('ISCC_hang_up_client', 'ISCC_hang_up_lpr')
+  AND T.cta_repository_id IS NOT NULL;
