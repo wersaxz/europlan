@@ -1,0 +1,68 @@
+-- ============================================================================
+-- ШАГ 1. Загрузка временной таблицы со списком ЛК из внешнего источника
+-- (выполнить файл insert_external_lk.sql ЦЕЛИКОМ перед этим блоком —
+-- он создаёт #external_lk_list: SourceId, inn, company_name)
+-- ============================================================================
+-- INSERT INTO #external_lk_list ... -- см. insert_external_lk.sql
+
+
+-- ============================================================================
+-- ШАГ 2. Справочник: все ЛК, которые когда-либо встречались
+-- как лизингодатель в dwh_AllPurchases (рынок ЛК)
+-- ============================================================================
+DROP TABLE IF EXISTS #all_market_lessors;
+
+SELECT DISTINCT
+    "Лизингодатель"     AS lessor_name,
+    "ИНН_лизингодателя" AS lessor_inn
+INTO #all_market_lessors
+FROM warehousepg."dwh_AllPurchases"
+WHERE "Лизинговая" = 1;
+
+
+-- ============================================================================
+-- ШАГ 3. ИНН лизингополучателей в сделках, где лизингодателем
+-- выступал сам ЕП (Источник = 'ЕП')
+-- ============================================================================
+DROP TABLE IF EXISTS #ep_as_lessor_deals;
+
+SELECT DISTINCT
+    "ИНН_лизингополучателя" AS inn_lessee
+INTO #ep_as_lessor_deals
+FROM warehousepg."dwh_AllPurchases"
+WHERE "Источник" = 'ЕП';
+
+
+-- ============================================================================
+-- ШАГ 4. Итог: список ЛК из внешнего файла (#external_lk_list) с признаками:
+--   - была ли эта ЛК среди лизингополучателей, кого ЕП профинансировал
+--     как лизингодатель (work_with_ep)
+--   - в ЧС или нет, по 1с и САФО (как в п.7, п.8 контактной политики)
+-- ============================================================================
+SELECT DISTINCT
+    ext.SourceId,
+    ext.inn,
+    ext.company_name,
+
+    -- работала ли эта ЛК с ЕП как лизингополучатель (ЕП — лизингодатель)
+    CASE WHEN EXISTS (
+        SELECT 1 FROM #ep_as_lessor_deals epd WHERE epd.inn_lessee = ext.inn
+    ) THEN 1 ELSE 0 END AS work_with_ep,
+
+    -- ЧС по 1с
+    COALESCE(MAX(CASE WHEN c."InBlackList_IC" = 1 THEN 1 ELSE 0 END), 0)   AS in_blacklist_ic,
+
+    -- ЧС по САФО
+    COALESCE(MAX(CASE WHEN c."InBlackList_SAFO" = 1 THEN 1 ELSE 0 END), 0) AS in_blacklist_safo,
+
+    -- сводный признак: 1, если хотя бы в одном из источников ЧС
+    COALESCE(
+        MAX(CASE WHEN c."InBlackList_IC" = 1 OR c."InBlackList_SAFO" = 1 THEN 1 ELSE 0 END),
+        0
+    ) AS in_blacklist_any
+
+FROM #external_lk_list ext
+LEFT JOIN "EKS"."WarmContactPolicy" c
+    ON c."inn" = ext.inn
+GROUP BY ext.SourceId, ext.inn, ext.company_name
+ORDER BY ext.company_name;
