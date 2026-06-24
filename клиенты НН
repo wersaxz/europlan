@@ -10,3 +10,21 @@ from ds.directory_identified_individuals dii
 left join dwh."AllPurchases" ap 
 on dii.инн_контрагента = ap."ИНН_лизингополучателя" 
 where ap."Город_лизингополучателя" like '%Нижний Новгород%'
+
+
+
+select count(distinct dii.инн_контрагента) as cnt_without_project
+from ds.directory_identified_individuals dii
+where exists (
+    select 1
+    from dwh."AllPurchases" ap
+    where ap."ИНН_лизингополучателя" = dii.инн_контрагента
+      and ap."Город_лизингополучателя" like '%Нижний Новгород%'
+)
+and not exists (
+    select 1
+    from dwh."Cta_Counteragents" cc
+    join dwh."SAFO_Project" sp
+        on sp."CtaRepositoryId" = cc."CtaRepositoryId"
+    where cc."INN" = dii.инн_контрагента
+)
