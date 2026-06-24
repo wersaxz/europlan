@@ -3,3 +3,13 @@ from ds.directory_identified_individuals dii
 left join dwh."AllPurchases" ap 
 on dii.инн_контрагента = ap."ИНН_лизингополучателя" 
 where ap."Город_лизингополучателя" like '%Нижний Новгород%'
+
+
+select distinct dii.инн_контрагента
+from ds.directory_identified_individuals dii
+where exists (
+    select 1
+    from dwh."AllPurchases" ap
+    where ap."ИНН_лизингополучателя" = dii.инн_контрагента
+      and ap."Город_лизингополучателя" like '%Нижний Новгород%'
+)
