@@ -5,14 +5,8 @@ on dii.инн_контрагента = ap."ИНН_лизингополучате
 where ap."Город_лизингополучателя" like '%Нижний Новгород%'
 
 
-select count(*)
-from (
-    select distinct ap.*
-    from dwh."AllPurchases" ap
-    where ap."Город_лизингополучателя" like '%Нижний Новгород%'
-      and exists (
-          select 1
-          from ds.directory_identified_individuals dii
-          where dii.инн_контрагента = ap."ИНН_лизингополучателя"
-      )
-) t
+select distinct dii.инн_контрагента
+from ds.directory_identified_individuals dii
+left join dwh."AllPurchases" ap 
+on dii.инн_контрагента = ap."ИНН_лизингополучателя" 
+where ap."Город_лизингополучателя" like '%Нижний Новгород%'
