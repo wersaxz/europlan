@@ -1,0 +1,5 @@
+select *
+from ds.directory_identified_individuals dii
+left join dwh."AllPurchases" ap 
+on dii.инн_контрагента = ap."ИНН_лизингополучателя" 
+where ap."Город_лизингополучателя" like '%Нижний Новгород%'
