@@ -1,6 +1,6 @@
 --=========================================================
--- 1. Целевые проекты: ВСЕ проекты из исходящего канала,
---    флаг "иной офис" переносим в признак
+-- 1. Целевые проекты: ТОЛЬКО исходящий канал ДКС,
+--    заведены с 01.03.2026 по текущую дату
 --=========================================================
 drop table if exists tt_projects;
 create temp table tt_projects as
@@ -8,14 +8,21 @@ select
         sp."CtaRepositoryId"
         ,li."project_id"
         ,sp."Дата создания проекта"
-        -- если хотя бы одно взаимодействие по проекту содержит комментарий
-        ,max(case when li."comment" ilike '%иной офис%' then 1 else 0 end) as "Проект с комментарием ""иной офис"""
+        ,max(case when li."comment" ilike '%иной офис%' then 1 else 0 end) as "Флаг иной офис"
 from
         voipclient.leasing_interaction as li
+        -- канал задачи по памятке: кампания типа 1 = Исходящий
+        join voipclient.leasing_task t
+                on li.task = t.id
+        join voipclient.leasing_campaign lc
+                on t.campaign = lc.id
+                and lc."type" = 1                       -- Исходящий канал ДКС
         join dwh."SAFO_Project" sp
                 on li."project_id" = sp."Номер проекта"
 where
         li.project_id is not null
+        and sp."Дата создания проекта" >= '2026-03-01'
+        and sp."Дата создания проекта" <= now()
 group by
         sp."CtaRepositoryId"
         ,li."project_id"
@@ -23,7 +30,7 @@ group by
 ;
 
 --=========================================================
--- 2. Текущий статус проекта (без изменений, + прокидываем флаг)
+-- 2. Текущий статус проекта
 --=========================================================
 drop table if exists tt_statuses;
 create temp table tt_statuses as
@@ -33,7 +40,7 @@ base as (
                 sp."CtaRepositoryId"
                 ,sp."project_id" as "Номер проекта"
                 ,sp."Дата создания проекта"
-                ,sp."Проект с комментарием ""иной офис"""
+                ,sp."Флаг иной офис"
                 ,max(spsl."Curr_DateTime") over (partition by sp."project_id") = spsl."Curr_DateTime" as current_status
                 ,pt."Name" as "Статус проекта"
         from
@@ -47,7 +54,7 @@ select
         b."CtaRepositoryId"
         ,b."Номер проекта"
         ,b."Дата создания проекта"
-        ,b."Проект с комментарием ""иной офис"""
+        ,b."Флаг иной офис"
         ,b."Статус проекта"
 from
         base b
@@ -67,7 +74,7 @@ cte as (
                 ,p."Номер проекта"
                 ,p."Статус проекта"
                 ,p."Дата создания проекта"
-                ,p."Проект с комментарием ""иной офис"""
+                ,p."Флаг иной офис"
                 ,row_number() over (partition by p."Номер проекта" order by ptcl."DateFrom" desc) = 1 as "Последний МОП в проекте"
                 ,ptcl."UserId" as "МОП_UserId"
                 ,s."Сотрудник" as "ФИО МОП"
@@ -114,8 +121,8 @@ select
                 else false
          end as "Факт атрибутивной передачи"
         ,sum(ic."ЧИ") as "ЧИ (прямые и атрибутивные передачи)"
-        ,cte."Проект с комментарием ""иной офис"""
-        ,case when cte."Проект с комментарием ""иной офис""" = 1 then 0 else 1 end as "Проект без комментария ""иной офис"""
+        ,cte."Флаг иной офис"
+        ,case when cte."Флаг иной офис" = 1 then 0 else 1 end as "Флаг без комментария"
         ,coalesce(pu."Факт покупки не в ЕП", 0) as "Факт покупки не в ЕП"
         ,coalesce(pu."Факт покупки в ЕП", 0)    as "Факт покупки в ЕП"
 from
@@ -141,7 +148,7 @@ group by
         ,safo."Name"
         ,"Проект передан в ЕП"
         ,"Факт атрибутивной передачи"
-        ,cte."Проект с комментарием ""иной офис"""
+        ,cte."Флаг иной офис"
         ,pu."Факт покупки не в ЕП"
         ,pu."Факт покупки в ЕП"
 ;
