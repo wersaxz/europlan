@@ -1,6 +1,7 @@
 --=========================================================
 -- 1. Целевые проекты: ТОЛЬКО исходящий канал ДКС,
 --    заведены с 01.03.2026 по текущую дату
+--    + МОП и Центр прибыли сразу из карточки проекта
 --=========================================================
 drop table if exists tt_projects;
 create temp table tt_projects as
@@ -8,6 +9,8 @@ select
         sp."CtaRepositoryId"
         ,li."project_id"
         ,sp."Дата создания проекта"
+        ,sp."МОП"
+        ,sp."Центр прибыли"
         ,max(case when li."comment" ilike '%иной офис%' then 1 else 0 end) as "Флаг иной офис"
 from
         voipclient.leasing_interaction as li
@@ -27,6 +30,8 @@ group by
         sp."CtaRepositoryId"
         ,li."project_id"
         ,sp."Дата создания проекта"
+        ,sp."МОП"
+        ,sp."Центр прибыли"
 ;
 
 --=========================================================
@@ -40,6 +45,8 @@ base as (
                 sp."CtaRepositoryId"
                 ,sp."project_id" as "Номер проекта"
                 ,sp."Дата создания проекта"
+                ,sp."МОП"
+                ,sp."Центр прибыли"
                 ,sp."Флаг иной офис"
                 ,max(spsl."Curr_DateTime") over (partition by sp."project_id") = spsl."Curr_DateTime" as current_status
                 ,pt."Name" as "Статус проекта"
@@ -54,6 +61,8 @@ select
         b."CtaRepositoryId"
         ,b."Номер проекта"
         ,b."Дата создания проекта"
+        ,b."МОП"
+        ,b."Центр прибыли"
         ,b."Флаг иной офис"
         ,b."Статус проекта"
 from
@@ -63,92 +72,64 @@ where
 ;
 
 --=========================================================
--- 3. Итоговая витрина: МОП + передачи + покупки на рынке
+-- 3. Итоговая витрина: передачи + покупки на рынке
 --=========================================================
 drop table if exists tt_projects_mop;
 create temp table tt_projects_mop as
 with
-cte as (
-        select
-                p."CtaRepositoryId"
-                ,p."Номер проекта"
-                ,p."Статус проекта"
-                ,p."Дата создания проекта"
-                ,p."Флаг иной офис"
-                ,row_number() over (partition by p."Номер проекта" order by ptcl."DateFrom" desc) = 1 as "Последний МОП в проекте"
-                ,ptcl."UserId" as "МОП_UserId"
-                ,s."Сотрудник" as "ФИО МОП"
-                ,s."SubdivisionId_SAFO" as "Субдивизион МОПа"
-        from
-                tt_statuses p
-                join dwh."SAFO_Projects_TeamChangeLog" ptcl
-                        on ptcl."ProjectId" = p."Номер проекта"
-                                and ptcl."RoleId" = 6
-                join dwh."Сотрудники" s
-                        on s."UserID_SAFO" = ptcl."UserId"
-                                and s."ActualRow" = 1
-),
 -- покупки в течение 60 дней после заведения проекта
 purchases as (
         select
-                c."Номер проекта"
+                p."Номер проекта"
                 ,max(case when ap."Источник" =  'ЕП' then 1 else 0 end) as "Факт покупки в ЕП"
                 ,max(case when ap."Источник" <> 'ЕП' then 1 else 0 end) as "Факт покупки не в ЕП"
         from
-                cte c
+                tt_statuses p
                 join dwh."AllPurchases" ap
-                        on ap."CtaRepositoryId" = c."CtaRepositoryId"
-                        and ap."ДатаПокупки" between c."Дата создания проекта"
-                                and (c."Дата создания проекта" + interval '60 days')
+                        on ap."CtaRepositoryId" = p."CtaRepositoryId"
+                        and ap."ДатаПокупки" between p."Дата создания проекта"
+                                and (p."Дата создания проекта" + interval '60 days')
                         and ap."ActualRow" = 1
-        where
-                c."Последний МОП в проекте"
         group by
-                c."Номер проекта"
+                p."Номер проекта"
 )
 select
-        cte."Номер проекта"
-        ,cte."Статус проекта"
-        ,cte."ФИО МОП"
-        ,cte."Субдивизион МОПа"
-        ,safo."Name"
+        p."Номер проекта"
+        ,p."Статус проекта"
+        ,p."МОП"
+        ,p."Центр прибыли"
         ,exists(select 1
                 from dwh."IC_ДоговорЛизинга" dl
-                where cte."Номер проекта" = dl."ProjectId"
+                where p."Номер проекта" = dl."ProjectId"
                         and dl."ПризнакПередачи" = 'Передан') as "Проект передан в ЕП"
         ,case
                 when tbi."Покупки в ЕП в теч 135 дней после закрытия задачи" > 0 then true
                 else false
          end as "Факт атрибутивной передачи"
         ,sum(ic."ЧИ") as "ЧИ (прямые и атрибутивные передачи)"
-        ,cte."Флаг иной офис"
-        ,case when cte."Флаг иной офис" = 1 then 0 else 1 end as "Флаг без комментария"
+        ,p."Флаг иной офис"
+        ,case when p."Флаг иной офис" = 1 then 0 else 1 end as "Флаг без комментария"
         ,coalesce(pu."Факт покупки не в ЕП", 0) as "Факт покупки не в ЕП"
         ,coalesce(pu."Факт покупки в ЕП", 0)    as "Факт покупки в ЕП"
 from
-        cte
+        tt_statuses p
         join ds."DCC_Tasks_BA_Info" tbi
-                on tbi."ProjectId" = cte."Номер проекта"
+                on tbi."ProjectId" = p."Номер проекта"
         left join dwh."IC_ДоговорЛизинга" ic
-                on ic."CtaRepositoryId" = cte."CtaRepositoryId"
+                on ic."CtaRepositoryId" = p."CtaRepositoryId"
                 and ic."ПризнакПередачи" = 'Передан'
-                and ic."ДатаПередачи" between cte."Дата создания проекта"
-                        and (cte."Дата создания проекта" + interval '135 days')
-        left join ds."FT_SAFO_Org_Structure_History"() safo
-                on safo."subdivisionid" = cte."Субдивизион МОПа"
+                and ic."ДатаПередачи" between p."Дата создания проекта"
+                        and (p."Дата создания проекта" + interval '135 days')
         left join purchases pu
-                on pu."Номер проекта" = cte."Номер проекта"
-where
-        cte."Последний МОП в проекте"
+                on pu."Номер проекта" = p."Номер проекта"
 group by
-        cte."Номер проекта"
-        ,cte."Статус проекта"
-        ,cte."ФИО МОП"
-        ,cte."Субдивизион МОПа"
-        ,safo."Name"
+        p."Номер проекта"
+        ,p."Статус проекта"
+        ,p."МОП"
+        ,p."Центр прибыли"
         ,"Проект передан в ЕП"
         ,"Факт атрибутивной передачи"
-        ,cte."Флаг иной офис"
+        ,p."Флаг иной офис"
         ,pu."Факт покупки не в ЕП"
         ,pu."Факт покупки в ЕП"
 ;
