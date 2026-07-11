@@ -1,0 +1,149 @@
+--=========================================================
+-- 1. Целевые проекты: ВСЕ проекты из исходящего канала,
+--    флаг "иной офис" переносим в признак
+--=========================================================
+drop table if exists tt_projects;
+create temp table tt_projects as
+select
+        sp."CtaRepositoryId"
+        ,li."project_id"
+        ,sp."Дата создания проекта"
+        -- если хотя бы одно взаимодействие по проекту содержит комментарий
+        ,max(case when li."comment" ilike '%иной офис%' then 1 else 0 end) as "Проект с комментарием ""иной офис"""
+from
+        voipclient.leasing_interaction as li
+        join dwh."SAFO_Project" sp
+                on li."project_id" = sp."Номер проекта"
+where
+        li.project_id is not null
+group by
+        sp."CtaRepositoryId"
+        ,li."project_id"
+        ,sp."Дата создания проекта"
+;
+
+--=========================================================
+-- 2. Текущий статус проекта (без изменений, + прокидываем флаг)
+--=========================================================
+drop table if exists tt_statuses;
+create temp table tt_statuses as
+with
+base as (
+        select
+                sp."CtaRepositoryId"
+                ,sp."project_id" as "Номер проекта"
+                ,sp."Дата создания проекта"
+                ,sp."Проект с комментарием ""иной офис"""
+                ,max(spsl."Curr_DateTime") over (partition by sp."project_id") = spsl."Curr_DateTime" as current_status
+                ,pt."Name" as "Статус проекта"
+        from
+                tt_projects sp
+                join dwh."SAFO_Projects_StatusLog" spsl
+                        on sp."project_id" = spsl."ProjectId"
+                join safo."Projects_Status" pt
+                        on spsl."Curr_StatusId" = pt."id"
+)
+select
+        b."CtaRepositoryId"
+        ,b."Номер проекта"
+        ,b."Дата создания проекта"
+        ,b."Проект с комментарием ""иной офис"""
+        ,b."Статус проекта"
+from
+        base b
+where
+        current_status
+;
+
+--=========================================================
+-- 3. Итоговая витрина: МОП + передачи + покупки на рынке
+--=========================================================
+drop table if exists tt_projects_mop;
+create temp table tt_projects_mop as
+with
+cte as (
+        select
+                p."CtaRepositoryId"
+                ,p."Номер проекта"
+                ,p."Статус проекта"
+                ,p."Дата создания проекта"
+                ,p."Проект с комментарием ""иной офис"""
+                ,row_number() over (partition by p."Номер проекта" order by ptcl."DateFrom" desc) = 1 as "Последний МОП в проекте"
+                ,ptcl."UserId" as "МОП_UserId"
+                ,s."Сотрудник" as "ФИО МОП"
+                ,s."SubdivisionId_SAFO" as "Субдивизион МОПа"
+        from
+                tt_statuses p
+                join dwh."SAFO_Projects_TeamChangeLog" ptcl
+                        on ptcl."ProjectId" = p."Номер проекта"
+                                and ptcl."RoleId" = 6
+                join dwh."Сотрудники" s
+                        on s."UserID_SAFO" = ptcl."UserId"
+                                and s."ActualRow" = 1
+),
+-- покупки в течение 60 дней после заведения проекта
+purchases as (
+        select
+                c."Номер проекта"
+                ,max(case when ap."Источник" =  'ЕП' then 1 else 0 end) as "Факт покупки в ЕП"
+                ,max(case when ap."Источник" <> 'ЕП' then 1 else 0 end) as "Факт покупки не в ЕП"
+        from
+                cte c
+                join dwh."AllPurchases" ap
+                        on ap."CtaRepositoryId" = c."CtaRepositoryId"
+                        and ap."ДатаПокупки" between c."Дата создания проекта"
+                                and (c."Дата создания проекта" + interval '60 days')
+                        and ap."ActualRow" = 1
+        where
+                c."Последний МОП в проекте"
+        group by
+                c."Номер проекта"
+)
+select
+        cte."Номер проекта"
+        ,cte."Статус проекта"
+        ,cte."ФИО МОП"
+        ,cte."Субдивизион МОПа"
+        ,safo."Name"
+        ,exists(select 1
+                from dwh."IC_ДоговорЛизинга" dl
+                where cte."Номер проекта" = dl."ProjectId"
+                        and dl."ПризнакПередачи" = 'Передан') as "Проект передан в ЕП"
+        ,case
+                when tbi."Покупки в ЕП в теч 135 дней после закрытия задачи" > 0 then true
+                else false
+         end as "Факт атрибутивной передачи"
+        ,sum(ic."ЧИ") as "ЧИ (прямые и атрибутивные передачи)"
+        ,cte."Проект с комментарием ""иной офис"""
+        ,case when cte."Проект с комментарием ""иной офис""" = 1 then 0 else 1 end as "Проект без комментария ""иной офис"""
+        ,coalesce(pu."Факт покупки не в ЕП", 0) as "Факт покупки не в ЕП"
+        ,coalesce(pu."Факт покупки в ЕП", 0)    as "Факт покупки в ЕП"
+from
+        cte
+        join ds."DCC_Tasks_BA_Info" tbi
+                on tbi."ProjectId" = cte."Номер проекта"
+        left join dwh."IC_ДоговорЛизинга" ic
+                on ic."CtaRepositoryId" = cte."CtaRepositoryId"
+                and ic."ПризнакПередачи" = 'Передан'
+                and ic."ДатаПередачи" between cte."Дата создания проекта"
+                        and (cte."Дата создания проекта" + interval '135 days')
+        left join ds."FT_SAFO_Org_Structure_History"() safo
+                on safo."subdivisionid" = cte."Субдивизион МОПа"
+        left join purchases pu
+                on pu."Номер проекта" = cte."Номер проекта"
+where
+        cte."Последний МОП в проекте"
+group by
+        cte."Номер проекта"
+        ,cte."Статус проекта"
+        ,cte."ФИО МОП"
+        ,cte."Субдивизион МОПа"
+        ,safo."Name"
+        ,"Проект передан в ЕП"
+        ,"Факт атрибутивной передачи"
+        ,cte."Проект с комментарием ""иной офис"""
+        ,pu."Факт покупки не в ЕП"
+        ,pu."Факт покупки в ЕП"
+;
+
+select * from tt_projects_mop;
