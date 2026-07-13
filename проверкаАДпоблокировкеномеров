@@ -8,7 +8,7 @@
 --   2. Проекты ДКС из report.dcc_ba_tasks_info
 --      (дата проекта = дата завершения задачи, прокси даты заведения)
 --   3. Передачи из WarehousePG.dwh_IC_ДоговорЛизинга на уровне клиента
---      (в таблице нет ProjectId, привязка к проекту невозможна)
+--      (в таблице нет номера проекта, привязка к проекту невозможна)
 --   4. Группы А/Б/В/Г по сроку от последнего проекта до блокировки
 --
 -- СУБД: MS SQL Server
@@ -22,11 +22,14 @@ DROP TABLE IF EXISTS #blocked_clients;
 
 SELECT
     T.branch_id                            AS client_id
-    ,MIN(BP.UpdateDate)                    AS block_date          -- самая ранняя дата занесения в ЧС
+    ,MIN(BP.UpdateDate)                    AS block_date          -- самая ранняя дата занесения в ЧС;
+                                                                  -- если нужно от последней блокировки — заменить на MAX
 INTO #blocked_clients
 FROM [Custom].[BlackList_ToInsert] BL
+-- дата блокировки лежит в BlackList_Phone, связь по BlackListToInsertID
 JOIN [Custom].[BlackList_Phone] BP
     ON BP.BlackListToInsertID = BL.ID
+-- цепочка "номер -> звонок -> интеракция -> задача" для получения клиента
 JOIN WarehousePG.voipclient_leasing_call_result CR
     ON CR.phone = BP.PhoneNumber
 JOIN WarehousePG.voipclient_leasing_interaction I
@@ -51,25 +54,25 @@ GROUP BY
 DROP TABLE IF EXISTS #all_projects;
 
 SELECT
-    TBI.ProjectId                          AS project_id
-    ,TBI.[Дата завершения задачи]          AS project_date        -- !!! подставь точное имя колонки с датой
+    TBI.[Номер проекта]                    AS project_id
+    ,TBI.[Дата завершения задачи]          AS project_date
     ,TBI.BranchId                          AS client_id
 INTO #all_projects
 FROM report.dcc_ba_tasks_info TBI
-WHERE TBI.ProjectId IS NOT NULL
+WHERE TBI.[Номер проекта] IS NOT NULL
 GROUP BY
-    TBI.ProjectId
+    TBI.[Номер проекта]
     ,TBI.[Дата завершения задачи]
     ,TBI.BranchId
 ;
 
 --==================================================================
---3. Передачи на уровне клиента (ProjectId в таблице нет)
+--3. Передачи на уровне клиента (номера проекта в таблице нет)
 --==================================================================
 DROP TABLE IF EXISTS #transfers;
 
 SELECT
-    DL.BranchId                            AS client_id           -- !!! подставь точное имя ключа клиента
+    DL.BranchId                            AS client_id
     ,DL.ДатаПередачи                       AS transfer_date
 INTO #transfers
 FROM WarehousePG.dwh_IC_ДоговорЛизинга DL
@@ -93,7 +96,7 @@ WITH projects_agg AS (
     FROM
         #blocked_clients bc
         -- inner join: группа определяется от последнего проекта до блокировки,
-        -- клиенты без проектов до блокировки в исследование не входят (как у АД)
+        -- клиенты без проектов до блокировки в исследование не входят
         JOIN #all_projects pb
             ON pb.client_id = bc.client_id
             AND pb.project_date < bc.block_date
