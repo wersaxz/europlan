@@ -95,4 +95,22 @@ SELECT
     END                                                                       AS [Количество дней после блокировки]
     ,COUNT(*)                                                                 AS [Клиентов с покупкой]
     -- размер всей когорты (включая клиентов без покупок) — одинаков во всех строках, справочно
-    ,(SELECT COUNT(
+    ,(SELECT COUNT(*) FROM #blocked_clients)                                  AS [Всего клиентов с блокировкой по мягким отказам]
+    -- доля группы от всей когорты; сумма по строкам < 1, остаток = клиенты без покупки
+    ,ROUND(COUNT(*) * 1.0 / (SELECT COUNT(*) FROM #blocked_clients), 4)       AS [Доля от всех блокировок по мягким отказам]
+FROM
+    #first_purchase fp
+GROUP BY
+    CASE
+        WHEN fp.days_to_purchase < 60  THEN '0-60 дней'
+        WHEN fp.days_to_purchase < 70  THEN '60-70 дней'
+        WHEN fp.days_to_purchase < 80  THEN '70-80 дней'
+        WHEN fp.days_to_purchase < 90  THEN '80-90 дней'
+        WHEN fp.days_to_purchase < 100 THEN '90-100 дней'
+        WHEN fp.days_to_purchase < 110 THEN '100-110 дней'
+        WHEN fp.days_to_purchase < 120 THEN '110-120 дней'
+        ELSE '120+ дней'
+    END
+ORDER BY
+    MIN(fp.days_to_purchase)
+;
