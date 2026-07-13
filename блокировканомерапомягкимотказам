@@ -1,0 +1,132 @@
+--==================================================
+-- Исследование: через сколько дней после блокировки
+-- (2-я подряд задача с "мягким" статусом) клиент
+-- совершает покупку (рынок / ЕП)
+--==================================================
+
+--==================================================
+--1. Номера телефонов по интеракциям
+--==================================================
+drop table if exists "tt_phones";
+create temp table "tt_phones" as
+select
+	interaction
+	,max(phone) as phone_number -- в одной интеракции может быть несколько номеров, у большинства 1
+from
+	voipclient.leasing_call_result
+where
+	created_at >= '2024-01-01'
+group by 1;
+
+--==================================================
+--2. Вторая подряд задача с "мягким" отказом (= момент блокировки)
+--   Логика без изменений из исходного скрипта
+--==================================================
+drop table if exists "tt_add_status";
+create temp table "tt_add_status" as
+with
+add_last_interactions as (
+	select
+		lt.branch_id
+		,li.task
+		,li.status
+		,li.ended
+		,lcr.phone_number
+		,max(li.ended) over (partition by li.task) = li.ended as "is_last_interaction"
+	from
+		voipclient."leasing_interaction" li
+		join voipclient."leasing_task" lt
+			on li.task = lt.id
+		join tt_phones lcr
+			on lcr.interaction = li.id
+	where li.ended >= '2024-01-01'
+)
+,last_interactions as (
+	select
+		li.branch_id
+		,li.task
+		,li.status
+		,li.phone_number
+		,li.ended
+		,"is_last_interaction"
+		,li.status = lag(li.status) over (partition by li.branch_id order by li.ended) as prev_status
+		,li.phone_number = lag(li.phone_number) over (partition by li.branch_id order by li.ended) as prev_phone_number
+	from
+		add_last_interactions li
+	where
+		"is_last_interaction" is true
+)
+select
+	li.branch_id as client_id
+	,min(li.task) as cancelled_task_id
+	,min(li.ended) as block_date          -- дата "блокировки" = завершение 2-й задачи
+from last_interactions li
+where "status" in (38, 84, 309)
+	and li.prev_status = true
+	and li.prev_phone_number = true
+group by branch_id
+;
+
+--==================================================
+--3. Первая покупка после блокировки (рынок / ЕП)
+--==================================================
+drop table if exists "tt_first_purchase";
+create temp table "tt_first_purchase" as
+with purchases as (
+	select
+		tas.client_id
+		,tas.block_date
+		,ap."ДатаПокупки"
+		,case when ap."Источник" = 'ЕП' then 'ЕП' else 'Рынок' end as purchase_source
+		,row_number() over (partition by tas.client_id order by ap."ДатаПокупки") = 1 as is_first_purchase
+	from
+		"tt_add_status" tas
+		join dwh."Cta_Counteragents" cta
+			on cta."BranchId" = tas.client_id
+		join dwh."AllPurchases" ap
+			on ap."CtaRepositoryId" = cta."CtaRepositoryId"
+			and ap."ActualRow" = 1
+			and ap."ДатаПокупки" > tas.block_date
+)
+select
+	client_id
+	,block_date
+	,"ДатаПокупки" as purchase_date
+	,purchase_source
+	,extract(day from "ДатаПокупки" - block_date) as days_to_purchase
+from purchases
+where is_first_purchase
+;
+
+--==================================================
+--4. Группировка по кол-ву дней до покупки
+--==================================================
+select
+	case
+		when days_to_purchase < 60  then '0-60 дней'
+		when days_to_purchase < 70  then '60-70 дней'
+		when days_to_purchase < 80  then '70-80 дней'
+		when days_to_purchase < 90  then '80-90 дней'
+		when days_to_purchase < 100 then '90-100 дней'
+		when days_to_purchase < 110 then '100-110 дней'
+		when days_to_purchase < 120 then '110-120 дней'
+		else '120+ дней'
+	end as "Количество дней после блокировки"
+	,count(*) filter (where purchase_source = 'Рынок') as "Клиентов купило на рынке"
+	,count(*) filter (where purchase_source = 'ЕП')    as "Клиентов купило в ЕП"
+	,count(*) as "Всего клиентов с покупкой"
+from
+	"tt_first_purchase"
+group by 1
+order by min(days_to_purchase)
+;
+
+-- Средний срок до покупки (справочно):
+select
+	 purchase_source as "Источник"
+	,round(avg(days_to_purchase), 1) as "Среднее кол-во дней до покупки"
+	,percentile_cont(0.5) within group (order by days_to_purchase) as "Медиана, дней"
+	,count(*) as "Клиентов"
+from "tt_first_purchase"
+group by purchase_source
+;
