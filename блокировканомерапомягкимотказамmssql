@@ -9,7 +9,8 @@
 --      Дата блокировки берётся из custom.BlackList_Phone.UpdateDate
 --      (в BlackList_ToInsert поля с датой нет).
 --   2. Для каждого клиента ищем ПЕРВУЮ покупку после даты блокировки.
---   3. Группируем клиентов по кол-ву дней от блокировки до покупки.
+--   3. Группируем клиентов по кол-ву дней от блокировки до покупки:
+--      0-60, далее шаг 10 дней до 600, затем 600+.
 --
 -- СУБД: MS SQL Server
 --==================================================================
@@ -49,8 +50,6 @@ GROUP BY
 
 --==================================================================
 --2. Первая покупка после блокировки
---   Берём первую покупку клиента строго ПОСЛЕ даты блокировки,
---   считаем кол-во дней между блокировкой и покупкой
 --==================================================================
 DROP TABLE IF EXISTS #first_purchase;
 
@@ -80,37 +79,34 @@ WHERE rn = 1
 
 --==================================================================
 --3. Итог: группировка по кол-ву дней от блокировки до покупки
---   + справочно общий размер когорты и доля группы от него
+--   Корзины: 0-60, далее шаг 10 дней (60-70 ... 590-600), затем 600+
+--   Корзина считается арифметикой: FLOOR(days/10)*10 — нижняя граница
 --==================================================================
 SELECT
-    CASE
-        WHEN fp.days_to_purchase < 60  THEN '0-60 дней'
-        WHEN fp.days_to_purchase < 70  THEN '60-70 дней'
-        WHEN fp.days_to_purchase < 80  THEN '70-80 дней'
-        WHEN fp.days_to_purchase < 90  THEN '80-90 дней'
-        WHEN fp.days_to_purchase < 100 THEN '90-100 дней'
-        WHEN fp.days_to_purchase < 110 THEN '100-110 дней'
-        WHEN fp.days_to_purchase < 120 THEN '110-120 дней'
-        ELSE '120+ дней'
-    END                                                                       AS [Количество дней после блокировки]
+    grp.[Количество дней после блокировки]
     ,COUNT(*)                                                                 AS [Клиентов с покупкой]
     -- размер всей когорты (включая клиентов без покупок) — одинаков во всех строках, справочно
     ,(SELECT COUNT(*) FROM #blocked_clients)                                  AS [Всего клиентов с блокировкой по мягким отказам]
     -- доля группы от всей когорты; сумма по строкам < 1, остаток = клиенты без покупки
     ,ROUND(COUNT(*) * 1.0 / (SELECT COUNT(*) FROM #blocked_clients), 4)       AS [Доля от всех блокировок по мягким отказам]
 FROM
-    #first_purchase fp
+    (
+        SELECT
+            fp.days_to_purchase
+            ,CASE
+                WHEN fp.days_to_purchase < 60   THEN '0-60 дней'
+                WHEN fp.days_to_purchase >= 600 THEN '600+ дней'
+                ELSE CONCAT(
+                        FLOOR(fp.days_to_purchase / 10) * 10
+                        ,'-'
+                        ,FLOOR(fp.days_to_purchase / 10) * 10 + 10
+                        ,' дней'
+                     )
+             END AS [Количество дней после блокировки]
+        FROM #first_purchase fp
+    ) grp
 GROUP BY
-    CASE
-        WHEN fp.days_to_purchase < 60  THEN '0-60 дней'
-        WHEN fp.days_to_purchase < 70  THEN '60-70 дней'
-        WHEN fp.days_to_purchase < 80  THEN '70-80 дней'
-        WHEN fp.days_to_purchase < 90  THEN '80-90 дней'
-        WHEN fp.days_to_purchase < 100 THEN '90-100 дней'
-        WHEN fp.days_to_purchase < 110 THEN '100-110 дней'
-        WHEN fp.days_to_purchase < 120 THEN '110-120 дней'
-        ELSE '120+ дней'
-    END
+    grp.[Количество дней после блокировки]
 ORDER BY
-    MIN(fp.days_to_purchase)
+    MIN(grp.days_to_purchase)
 ;
