@@ -1,0 +1,98 @@
+--==================================================================
+-- Исследование: через сколько дней после блокировки по мягким
+-- отказам клиент совершает покупку (dwh_AllPurchases)
+--
+-- Логика:
+--   1. Когорта = клиенты, чьи номера занесены в ЧС с причинами
+--      мягких отказов (ISCC_hang_up_client / ISCC_hang_up_lpr /
+--      ISCC_call_another_contact).
+--      Дата блокировки берётся из custom.BlackList_Phone.UpdateDate
+--      (в BlackList_ToInsert поля с датой нет).
+--   2. Для каждого клиента ищем ПЕРВУЮ покупку после даты блокировки.
+--   3. Группируем клиентов по кол-ву дней от блокировки до покупки.
+--
+-- СУБД: MS SQL Server
+--==================================================================
+
+--==================================================================
+--1. Когорта: заблокированные по мягким отказам
+--   1 строка = 1 клиент (cta_repository_id)
+--==================================================================
+DROP TABLE IF EXISTS #blocked_clients;
+
+SELECT
+    T.cta_repository_id                    AS client_id
+    ,MIN(BP.UpdateDate)                    AS block_date      -- самая ранняя дата занесения номера в ЧС;
+                                                              -- если нужно от последней блокировки — заменить на MAX
+INTO #blocked_clients
+FROM [Custom].[BlackList_ToInsert] BL
+-- дата блокировки лежит в BlackList_Phone, связь по BlackListToInsertID
+JOIN [Custom].[BlackList_Phone] BP
+    ON BP.BlackListToInsertID = BL.ID
+-- цепочка "номер -> звонок -> интеракция -> задача" для получения клиента
+JOIN WarehousePG.voipclient_leasing_call_result CR
+    ON CR.phone = BP.PhoneNumber
+JOIN WarehousePG.voipclient_leasing_interaction I
+    ON I.id = CR.interaction
+JOIN WarehousePG.voipclient_leasing_task T
+    ON T.id = I.task
+WHERE
+    -- только мягкие отказы:
+    -- ISCC_hang_up_client        = Не идет на контакт
+    -- ISCC_hang_up_lpr           = ЛПР не идет на контакт
+    -- ISCC_call_another_contact  = Нужно перезвонить другому контактному лицу
+    BL.InsertReason IN ('ISCC_hang_up_client', 'ISCC_hang_up_lpr', 'ISCC_call_another_contact')
+    AND T.cta_repository_id IS NOT NULL
+GROUP BY
+    T.cta_repository_id
+;
+
+--==================================================================
+--2. Первая покупка после блокировки
+--   Берём первую покупку клиента строго ПОСЛЕ даты блокировки,
+--   считаем кол-во дней между блокировкой и покупкой
+--==================================================================
+DROP TABLE IF EXISTS #first_purchase;
+
+WITH purchases AS (
+    SELECT
+        bc.client_id
+        ,bc.block_date
+        ,P.ДатаПокупки
+        -- нумеруем покупки клиента по возрастанию даты, rn = 1 -> первая покупка
+        ,ROW_NUMBER() OVER (PARTITION BY bc.client_id ORDER BY P.ДатаПокупки) AS rn
+    FROM
+        #blocked_clients bc
+        JOIN [WarehousePG].[dwh_AllPurchases] P
+            ON P.CtaRepositoryId = bc.client_id
+            AND P.ActualRow = 1                       -- актуальная версия строки покупки
+            AND P.ДатаПокупки > bc.block_date         -- покупки строго после блокировки
+)
+SELECT
+    client_id
+    ,block_date
+    ,ДатаПокупки                                     AS purchase_date
+    ,DATEDIFF(DAY, block_date, ДатаПокупки)          AS days_to_purchase
+INTO #first_purchase
+FROM purchases
+WHERE rn = 1
+;
+
+--==================================================================
+--3. Итог: группировка по кол-ву дней от блокировки до покупки
+--   + справочно общий размер когорты и доля группы от него
+--==================================================================
+SELECT
+    CASE
+        WHEN fp.days_to_purchase < 60  THEN '0-60 дней'
+        WHEN fp.days_to_purchase < 70  THEN '60-70 дней'
+        WHEN fp.days_to_purchase < 80  THEN '70-80 дней'
+        WHEN fp.days_to_purchase < 90  THEN '80-90 дней'
+        WHEN fp.days_to_purchase < 100 THEN '90-100 дней'
+        WHEN fp.days_to_purchase < 110 THEN '100-110 дней'
+        WHEN fp.days_to_purchase < 120 THEN '110-120 дней'
+        ELSE '120+ дней'
+    END                                                                       AS [Количество дней после блокировки]
+    ,COUNT(*)                                                                 AS [Клиентов с покупкой]
+    -- размер всей когорты (включая клиентов без покупок) — одинаков во всех строках, справочно
+    ,(SELECT COUNT(
