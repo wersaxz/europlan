@@ -1,7 +1,7 @@
 --==================================================
 -- Исследование: через сколько дней после блокировки
 -- (2-я подряд задача с "мягким" статусом) клиент
--- совершает покупку (рынок / ЕП)
+-- совершает покупку
 --==================================================
 
 --==================================================
@@ -20,7 +20,6 @@ group by 1;
 
 --==================================================
 --2. Вторая подряд задача с "мягким" отказом (= момент блокировки)
---   Логика без изменений из исходного скрипта
 --==================================================
 drop table if exists "tt_add_status";
 create temp table "tt_add_status" as
@@ -91,7 +90,7 @@ select
 	client_id
 	,block_date
 	,"ДатаПокупки" as purchase_date
-	,extract(day from "ДатаПокупки" - block_date) as days_to_purchase
+	,("ДатаПокупки"::date - block_date::date) as days_to_purchase  -- разность дат = целое число дней
 from purchases
 where is_first_purchase
 ;
@@ -117,14 +116,4 @@ from
 	"tt_first_purchase" fp
 group by 1
 order by min(fp.days_to_purchase)
-;
-
--- Средний срок до покупки (справочно):
-select
-	 purchase_source as "Источник"
-	,round(avg(days_to_purchase), 1) as "Среднее кол-во дней до покупки"
-	,percentile_cont(0.5) within group (order by days_to_purchase) as "Медиана, дней"
-	,count(*) as "Клиентов"
-from "tt_first_purchase"
-group by purchase_source
 ;
