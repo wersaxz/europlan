@@ -68,7 +68,7 @@ group by branch_id
 ;
 
 --==================================================
---3. Первая покупка после блокировки (рынок / ЕП)
+--3. Первая покупка после блокировки
 --==================================================
 drop table if exists "tt_first_purchase";
 create temp table "tt_first_purchase" as
@@ -77,7 +77,6 @@ with purchases as (
 		tas.client_id
 		,tas.block_date
 		,ap."ДатаПокупки"
-		,case when ap."Источник" = 'ЕП' then 'ЕП' else 'Рынок' end as purchase_source
 		,row_number() over (partition by tas.client_id order by ap."ДатаПокупки") = 1 as is_first_purchase
 	from
 		"tt_add_status" tas
@@ -92,7 +91,6 @@ select
 	client_id
 	,block_date
 	,"ДатаПокупки" as purchase_date
-	,purchase_source
 	,extract(day from "ДатаПокупки" - block_date) as days_to_purchase
 from purchases
 where is_first_purchase
@@ -103,22 +101,22 @@ where is_first_purchase
 --==================================================
 select
 	case
-		when days_to_purchase < 60  then '0-60 дней'
-		when days_to_purchase < 70  then '60-70 дней'
-		when days_to_purchase < 80  then '70-80 дней'
-		when days_to_purchase < 90  then '80-90 дней'
-		when days_to_purchase < 100 then '90-100 дней'
-		when days_to_purchase < 110 then '100-110 дней'
-		when days_to_purchase < 120 then '110-120 дней'
+		when fp.days_to_purchase < 60  then '0-60 дней'
+		when fp.days_to_purchase < 70  then '60-70 дней'
+		when fp.days_to_purchase < 80  then '70-80 дней'
+		when fp.days_to_purchase < 90  then '80-90 дней'
+		when fp.days_to_purchase < 100 then '90-100 дней'
+		when fp.days_to_purchase < 110 then '100-110 дней'
+		when fp.days_to_purchase < 120 then '110-120 дней'
 		else '120+ дней'
 	end as "Количество дней после блокировки"
-	,count(*) filter (where purchase_source = 'Рынок') as "Клиентов купило на рынке"
-	,count(*) filter (where purchase_source = 'ЕП')    as "Клиентов купило в ЕП"
-	,count(*) as "Всего клиентов с покупкой"
+	,count(*) as "Клиентов с покупкой"
+	,(select count(*) from "tt_add_status") as "Всего клиентов с блокировкой по мягким отказам"
+	,round(count(*) * 1.0 / (select count(*) from "tt_add_status"), 4) as "Доля от всех блокировок по мягким отказам"
 from
-	"tt_first_purchase"
+	"tt_first_purchase" fp
 group by 1
-order by min(days_to_purchase)
+order by min(fp.days_to_purchase)
 ;
 
 -- Средний срок до покупки (справочно):
