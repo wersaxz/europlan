@@ -1,1 +1,31 @@
-
+--==================================================================
+-- Связка заблокированных номеров (мягкие отказы) с контрагентами
+-- Цель: выгрузка для прозвона по МК
+--
+-- Один номер может принадлежать нескольким контрагентам — это ок,
+-- поэтому на выходе пары "номер + контрагент" (DISTINCT)
+--
+-- СУБД: MS SQL Server
+--==================================================================
+SELECT DISTINCT
+    BL.InsertReason                        AS [Причина попадания в блокировку]
+    ,BP.PhoneNumber                        AS [Номер телефона]
+    ,PL.CounteragentId                     AS [CtaRepositoryId]
+FROM [Custom].[BlackList_ToInsert] BL
+-- номера в ЧС
+JOIN [Custom].[BlackList_Phone] BP
+    ON BP.BlackListToInsertID = BL.ID
+-- связка номер -> контрагент (аналог cta."PhoneLinks")
+JOIN WarehousePG.cta_PhoneLinks PL
+    ON CAST(PL.Number AS NVARCHAR(20)) = BP.PhoneNumber
+    AND PL.RemovedAt IS NULL                              -- только действующие связки
+-- проверка существования контрагента (аналог cta."Counteragents")
+JOIN WarehousePG.cta_Counteragents C
+    ON C.Id = PL.CounteragentId
+WHERE
+    -- мягкие отказы:
+    -- ISCC_hang_up_client        = Не идет на контакт
+    -- ISCC_hang_up_lpr           = ЛПР не идет на контакт
+    -- ISCC_call_another_contact  = Нужно перезвонить другому контактному лицу
+    BL.InsertReason IN ('ISCC_hang_up_client', 'ISCC_hang_up_lpr', 'ISCC_call_another_contact')
+;
