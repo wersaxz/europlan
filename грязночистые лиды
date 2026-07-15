@@ -74,14 +74,12 @@ where
 drop table if exists tt_projects_mop;
 create temp table tt_projects_mop as
 with
--- покупки в течение 60 дней после заведения проекта
--- + дата первой покупки для расчёта расстояния в днях
-purchases as (
+-- факты покупок в течение 60 дней после заведения проекта (как в исходном отчёте)
+purchases_60 as (
         select
                 p."Номер проекта"
                 ,max(case when ap."Источник" =  'ЕП' then 1 else 0 end) as "Факт покупки в ЕП"
                 ,max(case when ap."Источник" <> 'ЕП' then 1 else 0 end) as "Факт покупки не в ЕП"
-                ,min(ap."ДатаПокупки") as "Дата первой покупки"
         from
                 tt_statuses p
                 join dwh."AllPurchases" ap
@@ -91,9 +89,25 @@ purchases as (
                         and ap."ActualRow" = 1
         group by
                 p."Номер проекта"
+),
+-- первая покупка после заведения проекта БЕЗ ограничения окна
+-- (для расчёта "Дней до покупки", чтобы попадали и атрибутивные)
+first_purchase as (
+        select
+                p."Номер проекта"
+                ,min(ap."ДатаПокупки") as "Дата первой покупки"
+        from
+                tt_statuses p
+                join dwh."AllPurchases" ap
+                        on ap."CtaRepositoryId" = p."CtaRepositoryId"
+                        and ap."ДатаПокупки" >= p."Дата создания проекта"
+                        and ap."ActualRow" = 1
+        group by
+                p."Номер проекта"
 )
 select
         p."Номер проекта"
+        ,p."Дата создания проекта"::date as "Дата создания проекта"
         ,exists(select 1
                 from dwh."IC_ДоговорЛизинга" dl
                 where p."Номер проекта" = dl."ProjectId"
@@ -108,8 +122,8 @@ select
         ,coalesce(pu."Факт покупки не в ЕП", 0) as "Факт покупки не в ЕП"
         ,coalesce(pu."Факт покупки в ЕП", 0)    as "Факт покупки в ЕП"
         -- расстояние в днях от заведения проекта до первой покупки (рынок или ЕП);
-        -- NULL = покупки в окне 60 дней не было
-        ,pu."Дата первой покупки"::date - p."Дата создания проекта"::date as "Дней до покупки"
+        -- окно не ограничено, NULL = покупки после заведения проекта не было
+        ,fp."Дата первой покупки"::date - p."Дата создания проекта"::date as "Дней до покупки"
         ,p."Статус проекта"
         ,p."МОП"
         ,p."Центр прибыли"
@@ -122,10 +136,13 @@ from
                 and ic."ПризнакПередачи" = 'Передан'
                 and ic."ДатаПередачи" between p."Дата создания проекта"
                         and (p."Дата создания проекта" + interval '135 days')
-        left join purchases pu
+        left join purchases_60 pu
                 on pu."Номер проекта" = p."Номер проекта"
+        left join first_purchase fp
+                on fp."Номер проекта" = p."Номер проекта"
 group by
         p."Номер проекта"
+        ,p."Дата создания проекта"
         ,p."Статус проекта"
         ,p."МОП"
         ,p."Центр прибыли"
