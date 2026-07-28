@@ -1,0 +1,79 @@
+with mk_projects as (
+    -- проекты, относящиеся к МК с АМ (campaign id = 504)
+    select distinct
+        dtbi."ProjectId" as "Номер проекта"
+    from voipclient."leasing_task" lt
+        join ds."DCC_Tasks_BA_Info" dtbi
+            on dtbi."TaskId" = lt."id"
+    where lt."campaign" = 504
+      and lt."created_at" >= '2025-01-01'
+      and dtbi."ProjectId" is not null
+),
+
+last_status as (
+    -- последняя запись лога статусов по каждому проекту
+    select
+         psl."ProjectId"
+        ,psl."RejectionReasonId"
+        ,psl."Description"
+        ,psl."CreatedAt"
+        ,row_number() over (partition by psl."ProjectId" order by psl."CreatedAt" desc) as rn
+    from safo."Projects_StatusLog" psl
+    where psl."CreatedAt" >= '2025-01-01'
+),
+
+market_purchase as (
+    -- самая ранняя покупка НА РЫНКЕ в течение 60 дней с даты создания проекта
+    -- ровно 1 строка на проект за счёт rn = 1
+    select
+         mp."Номер проекта"
+        ,mp."ДатаПокупки"
+        ,mp."Лизингодатель"
+    from (
+        select
+             sp."Номер проекта"
+            ,ap."ДатаПокупки"
+            ,ap."Лизингодатель"
+            ,row_number() over (
+                 partition by sp."Номер проекта"
+                 order by ap."ДатаПокупки" asc, ap."Лизингодатель" asc
+             ) as rn
+        from mk_projects mk
+            join dwh."SAFO_Project" sp
+                on sp."Номер проекта" = mk."Номер проекта"
+            join dwh."AllPurchases" ap
+                on  ap."CtaRepositoryId" = sp."CtaRepositoryId"
+                and ap."ДатаПокупки" between sp."Дата создания проекта"
+                                        and sp."Дата создания проекта" + interval '60 days'
+                and ap."Источник" <> 'ЕП'      -- покупка на рынке, не в Европлане
+    ) mp
+    where mp.rn = 1
+)
+
+select
+     sp."Номер проекта"
+    ,sp."Дата создания проекта"::date
+    ,sp."Центр прибыли"
+    ,sp."Подразделение"
+    ,sp."Статус"
+    ,sp."Этап"
+    ,rr."Name"            as "Причина Архива"
+    ,ls."Description"     as "Комментарий при Архивации проекта"
+    ,ls."CreatedAt"::date as "Последняя дата работы над проектом"
+    ,case
+        when mkt."Номер проекта" is not null then 1
+        else 0
+     end as "Покупка на рынке в 60 дней"
+    ,mkt."Лизингодатель" as "Лизингодатель (рынок, 60 дней)"
+from mk_projects mk
+    join dwh."SAFO_Project" sp
+        on sp."Номер проекта" = mk."Номер проекта"
+    left join last_status ls
+        on ls."ProjectId" = sp."Номер проекта"
+       and ls.rn = 1
+    left join safo."Projects_RejectionReason" rr
+        on rr."id" = ls."RejectionReasonId"
+    left join market_purchase mkt
+        on mkt."Номер проекта" = sp."Номер проекта"
+order by sp."Дата создания проекта" desc
+;
