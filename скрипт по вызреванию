@@ -1,0 +1,94 @@
+WITH RankedProjects AS (
+    SELECT 
+        rpj.[Номер проекта],
+        -- Логика МК
+        CASE 
+            WHEN rpj.[Прямой проект ДКС] = 1 AND rpj.[Исходный проект ДКС] IS NULL THEN bti_direct.МК
+            ELSE ISNULL(bti_source.МК, bti_direct.МК)
+        END AS МК_Final,
+        -- Данные оператора (по той же логике приоритета, что и МК)
+        CASE 
+            WHEN rpj.[Прямой проект ДКС] = 1 AND rpj.[Исходный проект ДКС] IS NULL THEN bti_direct.[Площадка]
+            ELSE ISNULL(bti_source.[Площадка], bti_direct.[Площадка])
+        END AS [Площадка],
+        CASE 
+            WHEN rpj.[Прямой проект ДКС] = 1 AND rpj.[Исходный проект ДКС] IS NULL THEN bti_direct.[Группа оператора]
+            ELSE ISNULL(bti_source.[Группа оператора], bti_direct.[Группа оператора])
+        END AS [Группа оператора],
+        CASE 
+            WHEN rpj.[Прямой проект ДКС] = 1 AND rpj.[Исходный проект ДКС] IS NULL THEN bti_direct.[Логин оператора]
+            ELSE ISNULL(bti_source.[Логин оператора], bti_direct.[Логин оператора])
+        END AS [Логин оператора],
+        CASE 
+            WHEN rpj.[Прямой проект ДКС] = 1 AND rpj.[Исходный проект ДКС] IS NULL THEN bti_direct.[ФИО оперератора]
+            ELSE ISNULL(bti_source.[ФИО оперератора], bti_direct.[ФИО оперератора])
+        END AS [ФИО оперератора],
+        -- Логика Даты для сводной
+        CASE 
+            WHEN rpj.[Прямой проект ДКС] = 1 AND rpj.[Исходный проект ДКС] IS NULL THEN CAST(rpj.[Дата проекта] AS DATE)
+            ELSE ISNULL(CAST(rpj.[Дата исходного проекта] AS DATE), CAST(rpj.[Дата проекта] AS DATE))
+        END AS [Дата старта (для сводной)],
+        -- Тип связи
+        CASE 
+            WHEN rpj.[Прямой проект ДКС] = 1 AND rpj.[Исходный проект ДКС] IS NULL THEN 'Прямой'
+            WHEN rpj.[Исходный проект ДКС] IS NOT NULL THEN 'АТР'
+            ELSE 'Прочее'
+        END AS [Тип связи проекта],
+        rpj.[Дата проекта],
+        rpj.[Прямой проект ДКС],
+        rpj.[Исходный проект ДКС],
+        rpj.[Дата исходного проекта],
+        rpj.[Дата передачи проекта],
+        rpj.[Номер ДФЛ],
+        rpj.ДатаПередачиДФЛ,
+        -- Расчеты месяцев
+        IIF(rpj.[Прямой проект ДКС] = 1 AND rpj.[Исходный проект ДКС] IS NULL, 
+            DATEDIFF(MONTH, rpj.[Дата проекта], rpj.[ДатаПередачиДФЛ]), NULL) AS [Прямой Месяцев],
+        IIF(rpj.[Исходный проект ДКС] IS NOT NULL, 
+            DATEDIFF(MONTH, rpj.[Дата исходного проекта], rpj.[ДатаПередачиДФЛ]), NULL) AS [АТР Месяцев],
+        --ЛОГИКА УНИКАЛЬНОСТИ
+        ROW_NUMBER() OVER (
+            PARTITION BY 
+                -- Если есть Исходный номер (для АТР), то уникальность считаем по НЕМУ.
+                -- Если Исходного нет (Прямой), то уникальность по самому Номеру Проекта.
+                ISNULL(rpj.[Исходный проект ДКС], rpj.[Номер проекта])
+            ORDER BY 
+                rpj.ДатаПередачиДФЛ ASC
+        ) as rn
+
+    FROM Report.Daily_ProjectMarketingCommunicationAttribution rpj
+    LEFT JOIN report.dcc_ba_tasks_info bti_direct 
+        ON rpj.[Номер проекта] = bti_direct.[Номер проекта]
+        AND bti_direct.Канал = 'Исходящие'
+        AND (bti_direct.[Был возвращен в КЦ] IS NULL OR bti_direct.[Был возвращен в КЦ] = 0)
+    LEFT JOIN report.dcc_ba_tasks_info bti_source 
+        ON rpj.[Исходный проект ДКС] = bti_source.[Номер проекта]
+        AND bti_source.Канал = 'Исходящие'
+        AND (bti_source.[Был возвращен в КЦ] IS NULL OR bti_source.[Был возвращен в КЦ] = 0)
+    WHERE 
+        rpj.[Дата проекта] >= DATEADD(MONTH, -60, GETDATE())
+        AND rpj.ДатаПередачиДФЛ IS NOT NULL 
+        AND rpj.[Дата передачи проекта] IS NOT NULL
+        AND (bti_direct.[Номер проекта] IS NOT NULL OR bti_source.[Номер проекта] IS NOT NULL)
+)
+SELECT 
+    [Номер проекта],
+    МК_Final AS МК,
+    [Площадка],
+    [Группа оператора],
+    [Логин оператора],
+    [ФИО оперератора],
+    [Тип связи проекта],
+    [Дата старта (для сводной)],
+    [Дата проекта],
+    [Прямой проект ДКС],
+    [Исходный проект ДКС],
+    [Дата исходного проекта],
+    [Дата передачи проекта],
+    [Номер ДФЛ],
+    ДатаПередачиДФЛ,
+    [Прямой Месяцев],
+    [АТР Месяцев],
+    ISNULL([Прямой Месяцев], [АТР Месяцев]) AS [Общий срок (мес)]
+FROM RankedProjects
+WHERE rn = 1;
