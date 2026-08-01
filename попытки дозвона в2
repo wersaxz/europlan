@@ -1,10 +1,14 @@
 --================================================================
--- МК 204, исходящий канал: на какой попытке заводится проект
--- Попытка дозвона = итерация со статусом автодозвона (НЕ все строки!)
+-- МК 204 (исходящий канал): на какой попытке дозвона заводится проект
+-- Попытки режутся на ГРУППЫ: группа закрывается дозвоном (клиент взял трубку)
+-- либо блоком номера после макс. числа автодозвонов (для МК 204 = 4).
+-- Счётчик попыток сбрасывается в начале каждой новой группы.
 -- Фильтр: дата завершения задачи >= 17.06.2026
 --================================================================
 
-with t204 as (
+with recursive
+
+t204 as (
     select
          lt."id"          as "TaskId"
         ,lt."created_at"  as "Дата создания задачи"
@@ -12,68 +16,106 @@ with t204 as (
         join voipclient."leasing_campaign" lc
             on lc."id" = lt."campaign"
     where lt."campaign" = 204
-      and lc."type" = 1
-),
-
-int_all as (
-    -- все итерации задач 204 + признак «это попытка дозвона»
-    select
-         li."task"       as "TaskId"
-        ,li."id"         as "InteractionId"
-        ,li."started"
-        ,li."ended"
-        ,li."project_id"
-        ,li."status"
-        ,case
-            when li."status" in ( 493 )   -- <<< СТАТУСЫ ПОПЫТОК: заполнить по диагностике
-            then 1 else 0
-         end as "Является попыткой"
-    from voipclient."leasing_interaction" li
-        join t204 t on t."TaskId" = li."task"
-    where li."started" is not null
+      and lc."type" = 1                      -- исходящий канал (страховка)
 ),
 
 attempts as (
-    -- нумеруем по порядку только попытки дозвона
+    -- каждая итерация = попытка дозвона; размечаем дозвон/недозвон по памятке
     select
-         ia.*
-        ,case when ia."Является попыткой" = 1
-              then row_number() over (
-                     partition by ia."TaskId", ia."Является попыткой"
-                     order by ia."started" asc, ia."InteractionId" asc)
-         end as "Номер попытки"
-    from int_all ia
+         li."task"        as "TaskId"
+        ,li."id"          as "InteractionId"
+        ,li."started"
+        ,li."ended"
+        ,li."project_id"
+        ,case
+            when (cs."class" <> 9 and li."status" <> 59)
+              or (cs."class" is null and li."status" is null)
+            then 1 else 0
+         end as "Дозвон"
+        ,row_number() over (partition by li."task"
+                            order by li."started", li."id") as "seq"
+    from voipclient."leasing_interaction" li
+        join t204 t on t."TaskId" = li."task"
+        left join voipclient."configuration_status" cs on cs."id" = li."status"
+    where li."started" is not null
+),
+
+grouped as (
+    -- рекурсивно нумеруем попытки внутри группы, сбрасывая счётчик при закрытии
+    select
+         a."TaskId", a."InteractionId", a."seq", a."started", a."ended"
+        ,a."Дозвон", a."project_id"
+        ,1 as "Попытка в группе"
+        ,1 as "Номер группы"
+        ,case when a."Дозвон" = 1 or 1 >= 4 then 1 else 0 end as "Группа закрыта"
+    from attempts a
+    where a."seq" = 1
+
+    union all
+
+    select
+         a."TaskId", a."InteractionId", a."seq", a."started", a."ended"
+        ,a."Дозвон", a."project_id"
+        ,case when g."Группа закрыта" = 1 then 1
+              else g."Попытка в группе" + 1 end                       as "Попытка в группе"
+        ,case when g."Группа закрыта" = 1 then g."Номер группы" + 1
+              else g."Номер группы" end                               as "Номер группы"
+        ,case
+            when a."Дозвон" = 1 then 1
+            when (case when g."Группа закрыта" = 1 then 1
+                       else g."Попытка в группе" + 1 end) >= 4 then 1  -- блок после 4 автодозвонов
+            else 0
+         end as "Группа закрыта"
+    from attempts a
+        join grouped g
+            on g."TaskId" = a."TaskId"
+           and a."seq" = g."seq" + 1
+),
+
+proj_row as (
+    -- попытка, на которой впервые появился проект (если несколько — первая)
+    select distinct on (g."TaskId")
+         g."TaskId"
+        ,g."project_id"
+        ,g."Попытка в группе" as "Попытка проекта"
+    from grouped g
+    where g."project_id" is not null
+    order by g."TaskId", g."seq"
+),
+
+last_row as (
+    -- размер последней группы (для недозвонных задач без проекта)
+    select distinct on (g."TaskId")
+         g."TaskId"
+        ,g."Попытка в группе" as "Попытка последней группы"
+    from grouped g
+    order by g."TaskId", g."seq" desc
 ),
 
 agg as (
     select
-         a."TaskId"
-        ,sum(a."Является попыткой")                                    as "Количество попыток дозвона"
-        ,max(a."ended")                                               as "Дата завершения задачи"
-        ,max(case when a."project_id" is not null then 1 else 0 end)  as "Факт заведения проекта"
-        ,min(a."project_id")                                          as "project_id"
-        ,min(case when a."project_id" is not null and a."Является попыткой" = 1
-                  then a."Номер попытки" end)                         as "Попытка заведения проекта"
-        ,max(case when a."project_id" is not null and a."Является попыткой" = 0
-                  then 1 else 0 end)                                  as "Проект на не-попытке"
-    from attempts a
-    group by a."TaskId"
+         t."TaskId"
+        ,t."Дата создания задачи"
+        ,max(g."ended")                                             as "Дата завершения задачи"
+        ,max(case when g."project_id" is not null then 1 else 0 end) as "Факт заведения проекта"
+    from grouped g
+        join t204 t on t."TaskId" = g."TaskId"
+    group by t."TaskId", t."Дата создания задачи"
 )
 
 select
-     t."Дата создания задачи"::date     as "Дата создания задачи"
-    ,ag."Дата завершения задачи"::date  as "Дата завершения задачи"
-    ,ag."TaskId"                        as "Номер задачи"
-    ,ag."Количество попыток дозвона"
+     ag."Дата создания задачи"::date     as "Дата создания задачи"
+    ,ag."Дата завершения задачи"::date   as "Дата завершения задачи"
+    ,ag."TaskId"                         as "Номер задачи"
+    ,coalesce(pr."Попытка проекта", lr."Попытка последней группы")
+                                         as "Количество попыток дозвона"
     ,ag."Факт заведения проекта"
-    ,ag."Попытка заведения проекта"
-    ,coalesce(sp."Номер проекта", ag."project_id") as "Номер проекта"
---  ,ag."Проект на не-попытке"          -- диагностика: 1 = проект прилетел на строке-разговоре, а не на автопопытке
+    ,coalesce(sp."Номер проекта", pr."project_id")
+                                         as "Номер проекта"
 from agg ag
-    join t204 t
-        on t."TaskId" = ag."TaskId"
-    left join dwh."SAFO_Project" sp
-        on sp."Номер проекта" = ag."project_id"
+    left join proj_row pr on pr."TaskId" = ag."TaskId"
+    left join last_row  lr on lr."TaskId" = ag."TaskId"
+    left join dwh."SAFO_Project" sp on sp."Номер проекта" = pr."project_id"
 where ag."Дата завершения задачи" >= '2026-06-17'
 order by ag."Дата завершения задачи" desc
 ;
