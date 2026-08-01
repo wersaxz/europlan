@@ -1,0 +1,79 @@
+--================================================================
+-- МК 204, исходящий канал: на какой попытке заводится проект
+-- Попытка дозвона = итерация со статусом автодозвона (НЕ все строки!)
+-- Фильтр: дата завершения задачи >= 17.06.2026
+--================================================================
+
+with t204 as (
+    select
+         lt."id"          as "TaskId"
+        ,lt."created_at"  as "Дата создания задачи"
+    from voipclient."leasing_task" lt
+        join voipclient."leasing_campaign" lc
+            on lc."id" = lt."campaign"
+    where lt."campaign" = 204
+      and lc."type" = 1
+),
+
+int_all as (
+    -- все итерации задач 204 + признак «это попытка дозвона»
+    select
+         li."task"       as "TaskId"
+        ,li."id"         as "InteractionId"
+        ,li."started"
+        ,li."ended"
+        ,li."project_id"
+        ,li."status"
+        ,case
+            when li."status" in ( 493 )   -- <<< СТАТУСЫ ПОПЫТОК: заполнить по диагностике
+            then 1 else 0
+         end as "Является попыткой"
+    from voipclient."leasing_interaction" li
+        join t204 t on t."TaskId" = li."task"
+    where li."started" is not null
+),
+
+attempts as (
+    -- нумеруем по порядку только попытки дозвона
+    select
+         ia.*
+        ,case when ia."Является попыткой" = 1
+              then row_number() over (
+                     partition by ia."TaskId", ia."Является попыткой"
+                     order by ia."started" asc, ia."InteractionId" asc)
+         end as "Номер попытки"
+    from int_all ia
+),
+
+agg as (
+    select
+         a."TaskId"
+        ,sum(a."Является попыткой")                                    as "Количество попыток дозвона"
+        ,max(a."ended")                                               as "Дата завершения задачи"
+        ,max(case when a."project_id" is not null then 1 else 0 end)  as "Факт заведения проекта"
+        ,min(a."project_id")                                          as "project_id"
+        ,min(case when a."project_id" is not null and a."Является попыткой" = 1
+                  then a."Номер попытки" end)                         as "Попытка заведения проекта"
+        ,max(case when a."project_id" is not null and a."Является попыткой" = 0
+                  then 1 else 0 end)                                  as "Проект на не-попытке"
+    from attempts a
+    group by a."TaskId"
+)
+
+select
+     t."Дата создания задачи"::date     as "Дата создания задачи"
+    ,ag."Дата завершения задачи"::date  as "Дата завершения задачи"
+    ,ag."TaskId"                        as "Номер задачи"
+    ,ag."Количество попыток дозвона"
+    ,ag."Факт заведения проекта"
+    ,ag."Попытка заведения проекта"
+    ,coalesce(sp."Номер проекта", ag."project_id") as "Номер проекта"
+--  ,ag."Проект на не-попытке"          -- диагностика: 1 = проект прилетел на строке-разговоре, а не на автопопытке
+from agg ag
+    join t204 t
+        on t."TaskId" = ag."TaskId"
+    left join dwh."SAFO_Project" sp
+        on sp."Номер проекта" = ag."project_id"
+where ag."Дата завершения задачи" >= '2026-06-17'
+order by ag."Дата завершения задачи" desc
+;
