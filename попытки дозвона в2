@@ -1,30 +1,27 @@
 --================================================================
 -- МК 204 (исходящий): на какой попытке дозвона заводится проект
 -- Правило Лёши: Кол-во попыток = GREATEST(макс.попыток в группе, число групп).
--- Группа закрывается ДОЗВОНОМ либо БЛОКОМ (count_attempts недозвонов подряд).
--- Лимит берётся из leasing_campaign_history.count_attempts НА МОМЕНТ ПОПЫТКИ
--- (настройка версионируется: была 3, стала 4).
+-- Группа закрывается ДОЗВОНОМ либо по достижении лимита count_attempts
+-- (что раньше) — жёстко, поэтому попыток в группе НЕ БОЛЬШЕ лимита.
+-- Лимит берётся из leasing_campaign_history.count_attempts НА МОМЕНТ ПОПЫТКИ.
 -- Дозвон/недозвон — по правилу из памятки (class=9 или status=59 = недозвон).
--- ФИЛЬТР: по АКТИВНОСТИ — задача попадает, если есть попытка со started >= 17.06.2026.
---   (группировка считается по ПОЛНОЙ истории задачи, фильтр применяется ПОСЛЕ.)
+-- Фильтр: дата завершения задачи >= 17.06.2026
 --================================================================
 
-with
+with recursive
 
 params as (
-    select 204 as campaign_id            -- <<< единственное, что меняется под другую МК
+    select 204 as campaign_id
 ),
 
 limit_hist as (
-    -- версии настройки count_attempts по МК с интервалами действия
     select
          lch."campaign"
         ,lch."count_attempts"
         ,lch."updated_at"                                        as date_from
-        ,coalesce(
-             lead(lch."updated_at") over (partition by lch."campaign"
-                                          order by lch."updated_at")
-            ,'infinity'::timestamp)                              as date_to
+        ,coalesce(lead(lch."updated_at") over (partition by lch."campaign"
+                                               order by lch."updated_at")
+                 ,'infinity'::timestamp)                         as date_to
     from voipclient."leasing_campaign_history" lch
         cross join params p
     where lch."campaign" = p.campaign_id
@@ -33,18 +30,15 @@ limit_hist as (
 ),
 
 base as (
-    select
-         lt."id"          as task
-        ,lt."created_at"  as created_at
+    select lt."id" as task, lt."created_at" as created_at
     from voipclient."leasing_task" lt
         join voipclient."leasing_campaign" lc on lc."id" = lt."campaign"
         cross join params p
     where lt."campaign" = p.campaign_id
-      and lc."type" = 1                              -- исходящий канал
+      and lc."type" = 1
 ),
 
 attempts as (
-    -- каждая итерация = попытка; + лимит, действовавший на момент попытки
     select
          li."task"        as task
         ,li."id"          as interaction_id
@@ -68,66 +62,51 @@ attempts as (
     where li."started" is not null
 ),
 
-islands as (
+walk as (
+    -- рекурсивно режем на группы: закрытие = дозвон ИЛИ достигли лимита
+    -- якорь: первая попытка задачи
     select
-         a.*
-        ,a.seq - row_number() over (partition by a.task, a.dozvon
-                                    order by a.seq) as island
+         a.task, a.interaction_id, a.seq, a."started", a."ended"
+        ,a.dozvon, a.project_id, a.attempt_limit
+        ,1 as attempt_in_grp
+        ,1 as grp
+        ,case when a.dozvon = 1 or 1 >= a.attempt_limit then 1 else 0 end as grp_closed
     from attempts a
-),
+    where a.seq = 1
 
-runs as (
-    select
-         i.*
-        ,case when i.dozvon = 0
-              then row_number() over (partition by i.task, i.dozvon, i.island
-                                      order by i.seq)
-         end as pos_in_run
-    from islands i
-),
+    union all
 
-closes as (
     select
-         r.*
+         a.task, a.interaction_id, a.seq, a."started", a."ended"
+        ,a.dozvon, a.project_id, a.attempt_limit
+        ,case when w.grp_closed = 1 then 1 else w.attempt_in_grp + 1 end as attempt_in_grp
+        ,case when w.grp_closed = 1 then w.grp + 1 else w.grp end        as grp
         ,case
-            when r.dozvon = 1                          then 1
-            when r.pos_in_run % r.attempt_limit = 0    then 1
+            when a.dozvon = 1 then 1
+            when (case when w.grp_closed = 1 then 1 else w.attempt_in_grp + 1 end)
+                 >= a.attempt_limit then 1
             else 0
-         end as is_close
-    from runs r
-),
-
-grouped as (
-    select
-         c.*
-        ,coalesce(sum(c.is_close) over (partition by c.task order by c.seq
-                     rows between unbounded preceding and 1 preceding), 0) as grp
-    from closes c
-),
-
-pos as (
-    select
-         g.*
-        ,row_number() over (partition by g.task, g.grp order by g.seq) as attempt_in_grp
-    from grouped g
+         end as grp_closed
+    from attempts a
+        join walk w
+          on w.task = a.task
+         and a.seq = w.seq + 1
 ),
 
 task_metrics as (
     select
          task
         ,max(attempt_in_grp)                                     as max_in_group
-        ,max(grp) + 1                                            as num_groups
+        ,max(grp)                                                as num_groups
         ,max("ended")                                            as ended
         ,max(case when project_id is not null then 1 else 0 end) as has_project
-        ,max("started")                                          as last_started   -- для фильтра активности
-    from pos
+    from walk
     group by task
 ),
 
 proj as (
-    select distinct on (task)
-         task, project_id
-    from pos
+    select distinct on (task) task, project_id
+    from walk
     where project_id is not null
     order by task, seq
 )
@@ -143,6 +122,6 @@ from base b
     join task_metrics tm on tm.task = b.task
     left join proj pr on pr.task = b.task
     left join dwh."SAFO_Project" sp on sp."Номер проекта" = pr.project_id
-where tm.last_started >= '2026-06-17'          -- <<< фильтр по АКТИВНОСТИ (последняя попытка после даты)
+where tm.ended >= '2026-06-17'
 order by tm.ended desc
 ;
