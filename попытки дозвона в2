@@ -1,14 +1,68 @@
+--================================================================
+-- МК 204 (исходящий): на какой попытке дозвона заводится проект
+-- Источник истины — dcc."FT_efficiency_of_dialing_attempts"().
+-- "Количество попыток дозвона" = MAX(dailing_indicator) по задаче
+-- (макс. размер группы; число групп в расчёт НЕ идёт).
+-- Функция считает с нуля → +1 для человеческого счёта.
+-- Фильтр: дата завершения задачи >= 17.06.2026
+--================================================================
+
+-- Материализуем функцию ОДИН раз (иначе пересчитывается при каждом обращении)
+drop table if exists tmp_fn;
+create temp table tmp_fn as
+select task, campaign, project, dailing_indicator
+from dcc."FT_efficiency_of_dialing_attempts"();
+create index on tmp_fn (campaign, task);
+
+with
+
+base as (
+    select lt."id" as task, lt."created_at" as created_at
+    from voipclient."leasing_task" lt
+        join voipclient."leasing_campaign" lc on lc."id" = lt."campaign"
+    where lt."campaign" = 204
+      and lc."type" = 1
+),
+
+task_end as (
+    select li."task" as task, max(li."ended") as ended
+    from voipclient."leasing_interaction" li
+        join base b on b.task = li."task"
+    group by li."task"
+),
+
+fn_agg as (
+    select
+         f.task
+        ,max(f.dailing_indicator) + 1                             as "Количество попыток дозвона"  -- +1: функция считает с 0
+        ,max(case when f.project is not null then 1 else 0 end)   as has_project
+    from tmp_fn f
+    where f.campaign = 204
+    group by f.task
+),
+
+proj as (
+    -- реальный номер проекта (функция даёт только флаг = task_id)
+    select distinct on (li."task")
+         li."task" as task, li."project_id" as project_id
+    from voipclient."leasing_interaction" li
+        join base b on b.task = li."task"
+    where li."project_id" is not null
+    order by li."task", li."started"
+)
+
 select
-     li."status"
-    ,cs."class"        as status_class
-    ,cc."name"         as class_name
-    ,count(*)          as "Итераций"
-    ,round(avg(extract(epoch from (li."ended" - li."started"))))::int as "Ср_сек"
-from voipclient."leasing_interaction" li
-    join voipclient."leasing_task" lt on lt."id" = li."task"
-    left join voipclient."configuration_status" cs on cs."id" = li."status"
-    left join voipclient."configuration_class"  cc on cs."class" = cc."id"
-where lt."campaign" = 204
-  and li."started" is not null
-group by li."status", cs."class", cc."name"
-order by count(*) desc;
+     b.created_at::date                             as "Дата создания задачи"
+    ,te.ended::date                                 as "Дата завершения задачи"
+    ,b.task                                         as "Номер задачи"
+    ,fa."Количество попыток дозвона"
+    ,coalesce(fa.has_project, 0)                    as "Факт заведения проекта"
+    ,coalesce(sp."Номер проекта", pr.project_id)    as "Номер проекта"
+from base b
+    join task_end te on te.task = b.task
+    left join fn_agg fa on fa.task = b.task
+    left join proj   pr on pr.task = b.task
+    left join dwh."SAFO_Project" sp on sp."Номер проекта" = pr.project_id
+where te.ended >= '2026-06-17'
+order by te.ended desc
+;
