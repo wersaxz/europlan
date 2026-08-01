@@ -1,0 +1,666 @@
+-- Теги: МПП, грейд, метрики, сотрдник, ДКС
+
+--================================================================
+--Повторные ГК и дата, когда они стали повторными
+--================================================================	
+
+drop table if exists "tt_rep";
+create temp table "tt_rep" as
+select distinct 
+		 coalesce(cta."GroupByOwnerId", -cta."CtaRepositoryId") as "GroupByOwnerId"
+		,min(dl."ДатаПередачи") as "ДатаПередачи"
+	from 	
+		dwh."IC_ДоговорЛизинга" dl
+	join 
+		dwh."Cta_Counteragents" cta 
+	on dl."BranchId" = cta."BranchId" 
+	where 
+		dl."ДатаПередачи" is not null
+	group by 
+		coalesce(cta."GroupByOwnerId", -cta."CtaRepositoryId")
+;
+
+--================================================================
+--Собираем входящие звонки (Для чего блок ниже  не до конца понял, но у Морина есть)
+--================================================================	
+--Select * from "tt_dop_tasks"
+--select * from voipclient.history_call
+drop table if exists "tt_dop_tasks";
+create temp table "tt_dop_tasks" as 
+select
+		c.id,
+		c.contact,
+		ic.answ_time,
+		coalesce(coalesce(li.endtime, csi.ended_at), c.ended) as endtime,
+		li.task,
+		'Входящий звонок' as campaign_name
+		,c."operator" 
+	from
+		voipclient.history_call c
+	inner join 
+		(select ica."call"
+				,min(ica."created") as answ_time
+		from voipclient.history_states_inbound_call ica 
+		where ica."created" >= '2023-01-01'
+		and ica."created" < '2024-01-01'
+		and ica."skill" = 9
+		and ica."state_skill" = 3
+		group by ica."call"
+		) ic
+	on ic."call" = c.id
+	left join 
+		(select contact
+				,min(ended_at) as ended_at
+			from voipclient.client_service_interaction
+			where ended_at is not null
+			group by contact
+		) csi
+	on csi.contact = c.contact
+	left join 
+		(select contact
+			   ,min(task) as task
+			   ,min(ended) as endtime
+		from voipclient.leasing_interaction 
+		where ended is not null
+		group by contact
+	) li
+	on li.contact = c.contact
+	where c.contact is not null
+;
+
+--================================================================
+--Собираем все итерации, джойним таблицу выше
+--================================================================	 
+--select * from "tt_interactions" where  campaign_name != 'Входящий звонок' and "Деактивирована" = 1
+--select starttime - endtime from "tt_interactions" where starttime > endtime order by (starttime - endtime) desc
+--select * from voipclient.leasing_campaign
+
+drop table if exists "tt_interactions";
+create temp table "tt_interactions" as 	
+select
+		 coalesce(i.task, c.id * -1) as task
+		,coalesce(i."operator", c."operator") as "operator"
+		,coalesce(t.created_at, c.answ_time) as created_at 
+		,coalesce(t.campaign_name, c.campaign_name) as campaign_name
+		,coalesce(t."Канал", 'Звонки') as "Канал"
+		,coalesce(c.answ_time, i.started) as starttime
+		,case when coalesce(i.ended, c.endtime) < coalesce(c.answ_time, i.started)
+			  then coalesce(i.ended, c.endtime) + '3 hour'::interval 
+			  else coalesce(i.ended, c.endtime) 
+			  end as endtime
+		,case 
+			when (cs."class" != 9 and i."status" != 59) or (cs."class" IS NULL and i."status" is null) then 1
+			else 0
+		 end as "Дозвон"
+		,case
+			when i.status = 211 then 1
+			else 0
+		 end as "Наличие встречи"
+		,t."Деактивирована"
+	from
+		voipclient.leasing_interaction i
+	left join voipclient.configuration_status as cs
+		on i.status = cs.id
+	join (
+		 select t.id
+		 		,lc."name" as campaign_name
+		 		,t.campaign
+		 		,t.created_at 
+		 		,case when lc."type" = 2 then 'Звонки' 
+			  		  when lc."type" = 3 and t.payload_type != 'partners' then 'Заявки'
+			          when lc."type" = 1 then 'Исходящий'
+			          when t.payload_type = 'partners' then 'Поставщики'
+			          end "Канал"
+			    ,case when t.status = 233 then 1 else 0 end as "Деактивирована"
+		 	from voipclient.leasing_task t
+			left join voipclient.leasing_campaign lc 
+			on t.campaign = lc.id 
+			where t."status" in (122, 233)
+			and t.created_at >= '2023-01-01'
+			and t.created_at < '2024-01-01'
+			and not exists(
+						select 1
+					    from voipclient.leasing_interaction
+						where task = t.id
+						and (
+							ended is null
+						or started is null
+							)
+						)
+		) t
+			on t.id = i.task
+		full join
+			"tt_dop_tasks" c
+		on
+			c.task = t.id
+		and c.contact = i.contact
+		where 
+			i."operator" != 1
+		or i."operator" is null
+;	
+
+--================================================================
+--Определяем last_starttime
+--================================================================
+--select distinct "Должность" from "tt_interactions_2" where "Должность" is null campaign_name != 'Входящий звонок'
+--select distinct "Должность", "Подразделение", "Грейд" from "tt_interactions_2"
+
+drop table if exists "tt_interactions_2";
+create temp table "tt_interactions_2" as 
+select
+		 ti.task
+		,ti."operator"
+		,op.login 
+		,concat(op.last_name,' ',op.second_name,' ',op.first_name ) as "ФИО"
+		,sotr."Должность" 
+		,sotr."Подразделение"
+		,case when sotr."Должность" ilike '%старший%' then 'СМПП'
+			  when sotr."Должность" ilike '%младший%' then 'ММПП'
+			  when sotr."Должность" ilike '%ведущий%' then 'ВМПП'
+			  when sotr."Должность" ilike '%главный%' then 'ГМПП'
+			  when sotr."Должность" in ('Эксперт', 'Менеджер', 'Специалист', 'Внештатный менеджер') then 'МПП'
+			  else 'Прочие'
+			  end "Грейд"
+		,ti.created_at
+		,ti."Деактивирована"
+		,ti."Наличие встречи"
+		,ti.campaign_name
+		,ti."Канал"
+		,ti.starttime
+		,case
+			when MAX(ti.starttime) over(partition by ti.task) = ti.starttime then 1
+			else 0 
+		 end as last_starttime
+		,ti.endtime
+		,ti."Дозвон"
+	from
+		"tt_interactions" ti 
+	left join 
+		 voipclient.configuration_operator AS op
+	on ti."operator" = op.id
+	left join 
+		dwh."Сотрудники" sotr 
+	on sotr."Логин" = op.login 
+	and ti.starttime > sotr."DateFrom" 
+	and ti.starttime < sotr."DateTo" 
+	where 
+		ti.starttime < ti.endtime
+;
+--select * from dwh."Сотрудники" 
+--================================================================
+--Агрегируем до таски
+--================================================================
+--select distinct "Канал", campaign_name from  "tt_itog" where task<0
+
+drop table if exists "tt_itog";
+create temp table "tt_itog" as
+with a as 
+(select
+			 t.task
+			,t.created_at
+			,coalesce(t."Деактивирована",0) as "Деактивирована"
+			,max("Наличие встречи") as "Наличие встречи"
+			,t.campaign_name
+			,t."Канал"
+			,case when tt.task is not null then 1 else 0 end "Был проект"
+			,max(case when t.last_starttime = 1 and Дозвон = 1 
+		    		  then 1 else 0
+					  end) as "Дозвон"
+			,sum(((DATE_PART('day', t.endtime::timestamp - t.starttime) * 24 + 
+                DATE_PART('hour', t.endtime::timestamp - t.starttime)) * 60 +
+                DATE_PART('minute', t.endtime::timestamp - t.starttime)) * 60 +
+                DATE_PART('second', t.endtime::timestamp - t.starttime)) as "Продолжительность задачи"
+           ,proj.project_id
+           ,coalesce(cta."GroupByOwnerId", -cta."CtaRepositoryId") as "GroupByOwnerId"
+	from
+		"tt_interactions_2" t
+	left join (
+				select distinct task
+				from voipclient.leasing_interaction i
+					left join voipclient.configuration_status cs 
+						on i.status = cs.id 
+				where cs."class" = 34
+				) tt
+	on t.task = tt.task
+	left join (
+				select distinct task, project_id
+				from voipclient.leasing_interaction i
+				where project_id is not null
+				) proj
+	on t.task =proj.task
+	left join 
+		dwh."SAFO_Project" sp 
+	on sp."Номер проекта" = proj.project_id
+	left join 
+		dwh."Cta_Counteragents" cta 
+	on sp."BranchId" = cta."BranchId" 
+	group by 
+      	 t.task
+		,t.campaign_name
+		,t.created_at
+		,t."Деактивирована"
+		,t."Канал"
+		,tt.task
+		,proj.project_id
+		,coalesce(cta."GroupByOwnerId", -cta."CtaRepositoryId")
+) 
+select 
+		 a.task
+		,a.created_at
+		,a."Деактивирована"
+		,a."Наличие встречи"
+		,a.campaign_name
+		,a."Канал"
+		,a."Дозвон"
+		,a."Продолжительность задачи"
+		,a.project_id
+		,a."GroupByOwnerId"
+		,a."Был проект"
+		,case when rp."ДатаПередачи" is null or rp."ДатаПередачи" > a.created_at then 'Новый' else 'Повторный' end as "Повторность"
+	from  a 
+	left join 
+		"tt_rep" rp 
+	on a."GroupByOwnerId" = rp."GroupByOwnerId"            
+;
+
+--select * from dwh."Сотрудники" 
+--================================================================
+--Агрегируем до таски + грейды
+--================================================================
+--select distinct "Канал", campaign_name from  "tt_itog" where task<0
+
+drop table if exists "tt_itog2";
+create temp table "tt_itog2" as
+with a as 
+(select
+			 t.task
+			,"Грейд"
+			,t.created_at
+			,coalesce(t."Деактивирована",0) as "Деактивирована"
+			,max("Наличие встречи") as "Наличие встречи"
+			,t.campaign_name
+			,t."Канал"
+			,case when tt.task is not null then 1 else 0 end "Был проект"
+			,max(case when t.last_starttime = 1 and Дозвон = 1 
+		    		  then 1 else 0
+					  end) as "Дозвон"
+			,sum(((DATE_PART('day', t.endtime::timestamp - t.starttime) * 24 + 
+                DATE_PART('hour', t.endtime::timestamp - t.starttime)) * 60 +
+                DATE_PART('minute', t.endtime::timestamp - t.starttime)) * 60 +
+                DATE_PART('second', t.endtime::timestamp - t.starttime)) as "Продолжительность задачи"
+           ,proj.project_id
+           ,coalesce(cta."GroupByOwnerId", -cta."CtaRepositoryId") as "GroupByOwnerId"
+	from
+		"tt_interactions_2" t
+	left join (
+				select distinct task
+				from voipclient.leasing_interaction i
+					left join voipclient.configuration_status cs 
+						on i.status = cs.id 
+				where cs."class" = 34
+				) tt
+	on t.task = tt.task
+	left join (
+				select distinct task, project_id
+				from voipclient.leasing_interaction i
+				where project_id is not null
+				) proj
+	on t.task =proj.task
+	left join 
+		dwh."SAFO_Project" sp 
+	on sp."Номер проекта" = proj.project_id
+	left join 
+		dwh."Cta_Counteragents" cta 
+	on sp."BranchId" = cta."BranchId" 
+	group by 
+      	 t.task
+      	,"Грейд"
+		,t.campaign_name
+		,t.created_at
+		,t."Деактивирована"
+		,t."Канал"
+		,tt.task
+		,proj.project_id
+		,coalesce(cta."GroupByOwnerId", -cta."CtaRepositoryId")
+) 
+select 
+		 a.task
+		,"Грейд"
+		,a.created_at
+		,a."Деактивирована"
+		,a."Наличие встречи"
+		,a.campaign_name
+		,a."Канал"
+		,a."Дозвон"
+		,a."Продолжительность задачи"
+		,a.project_id
+		,a."GroupByOwnerId"
+		,a."Был проект"
+		,case when rp."ДатаПередачи" is null or rp."ДатаПередачи" > a.created_at then 'Новый' else 'Повторный' end as "Повторность"
+	from  a 
+	left join 
+		"tt_rep" rp 
+	on a."GroupByOwnerId" = rp."GroupByOwnerId"            
+;
+
+--================================================================
+--Агрегированная статистика по месяцам
+--================================================================
+drop table if exists "s";
+create temp table "s" as
+select 
+		ti."Канал"
+		,cast(date_trunc('month', ti.created_at) as date) as "Месяц"
+		,avg(case when ti."Дозвон" = 1 and ti."Был проект"= 0 then "Продолжительность задачи" else null end) as "Время на задачу без проекта с дозвоном"
+		,avg(case when ti."Был проект"= 1 then "Продолжительность задачи" else null end) as "Время на задачу с проектом"
+		,sum(case when ti."Деактивирована" = 1 then "Продолжительность задачи" else 0 end)*1.0 /
+			sum("Продолжительность задачи") as "Время на деактивированные задачи"
+		,sum(case when ti."Дозвон" = 0 then "Продолжительность задачи" else 0 end)*1.0 /
+			sum("Продолжительность задачи") as "Время на задачи с недозвоном"
+		,sum("Был проект")*1.0/(case when ti."Канал" = 'Исходящий' 
+									 then count(case when ti."Дозвон" = 1 and ti."Деактивирована" = 0 then task else null end)
+									 when ti."Канал" = 'Звонки'
+									 then count(case when ti."Деактивирована" = 0 and task > 0 then task else null end)
+									 else count(case when ti."Деактивирована" = 0 then task else null end) end) as "Конверсия из закрытой задачи в проект"
+		,case 
+			when sum("Был проект") = 0
+			then 0
+			else sum("Наличие встречи")*1.0/sum("Был проект") 
+		end as "Доля проектов со встречей"
+	from 
+		"tt_itog" ti 
+	group by 
+		ti."Канал"
+		,cast(date_trunc('month', ti.created_at) as date)
+;
+
+--================================================================
+--Агрегированная статистика по месяцам + грейды
+--================================================================
+drop table if exists "Final";
+create temp table "Final" as
+select 
+		ti."Канал"
+		,"Грейд"
+		--,cast(date_trunc('month', ti.created_at) as date) as "Месяц"
+		,avg(case when ti."Дозвон" = 1 and ti."Был проект"= 0 then "Продолжительность задачи" else null end) as "Время на задачу без проекта с дозвоном"
+		,avg(case when ti."Был проект"= 1 then "Продолжительность задачи" else null end) as "Время на задачу с проектом"
+		,sum(case when ti."Деактивирована" = 1 then "Продолжительность задачи" else 0 end)*1.0 /
+			sum("Продолжительность задачи") as "Время на деактивированные задачи"
+		,sum(case when ti."Дозвон" = 0 then "Продолжительность задачи" else 0 end)*1.0 /
+			sum("Продолжительность задачи") as "Время на задачи с недозвоном"
+		,case 
+			when (case when ti."Канал" = 'Исходящий' 
+									 then count(case when ti."Дозвон" = 1 and ti."Деактивирована" = 0 then task else null end)
+									 when ti."Канал" = 'Звонки'
+									 then count(case when ti."Деактивирована" = 0 and task > 0 then task else null end)
+									 else count(case when ti."Деактивирована" = 0 then task else null end) end) =0
+			 then 0
+			 else sum("Был проект")*1.0/(case when ti."Канал" = 'Исходящий' 
+									 then count(case when ti."Дозвон" = 1 and ti."Деактивирована" = 0 then task else null end)
+									 when ti."Канал" = 'Звонки'
+									 then count(case when ti."Деактивирована" = 0 and task > 0 then task else null end)
+									 else count(case when ti."Деактивирована" = 0 then task else null end) end)
+		end as "Конверсия из закрытой задачи в проект"
+		,case 
+			when sum("Был проект") = 0
+			then 0
+			else sum("Наличие встречи")*1.0/sum("Был проект") 
+		end as "Доля проектов со встречей"
+	from 
+		"tt_itog2" ti 
+	group by 
+		ti."Канал"
+		,"Грейд"
+		--,cast(date_trunc('month', ti.created_at) as date)
+;
+--================================================================
+--Агрегированная статистика 
+--================================================================
+
+drop table if exists "Final_year";
+create temp table "Final_year" as
+select 
+		ti."Канал"
+		,avg(case when ti."Дозвон" = 1 and ti."Был проект"= 0 then "Продолжительность задачи" else null end) as "Время на задачу без проекта с дозвоном"
+		,avg(case when ti."Был проект"= 1 then "Продолжительность задачи" else null end) as "Время на задачу с проектом"
+		,sum(case when ti."Деактивирована" = 1 then "Продолжительность задачи" else 0 end)*1.0 /
+			sum("Продолжительность задачи") as "Время на деактивированные задачи"
+		,sum(case when ti."Дозвон" = 0 then "Продолжительность задачи" else 0 end)*1.0 /
+			sum("Продолжительность задачи") as "Время на задачи с недозвоном"
+		,sum("Был проект")*1.0/(case when ti."Канал" = 'Исходящий' 
+									 then count(case when ti."Дозвон" = 1 and ti."Деактивирована" = 0 then task else null end)
+									 when ti."Канал" = 'Звонки'
+									 then count(case when ti."Деактивирована" = 0 and task > 0 then task else null end)
+									 else count(case when ti."Деактивирована" = 0 then task else null end) end) as "Конверсия из закрытой задачи в проект"
+		,sum("Наличие встречи")*1.0/sum("Был проект") as "Доля проектов со встречей"
+	from 
+		"tt_itog" ti 
+	group by 
+		ti."Канал"
+;
+--================================================================
+--Агрегированная статистика + грейды
+--================================================================
+drop table if exists "a";
+create temp table "a" as
+select 
+		ti."Канал"
+		,"Грейд"
+		,avg(case when ti."Дозвон" = 1 and ti."Был проект"= 0 then "Продолжительность задачи" else null end) as "Время на задачу без проекта с дозвоном"
+		,avg(case when ti."Был проект"= 1 then "Продолжительность задачи" else null end) as "Время на задачу с проектом"
+		,sum(case when ti."Деактивирована" = 1 then "Продолжительность задачи" else 0 end)*1.0 /
+			sum("Продолжительность задачи") as "Время на деактивированные задачи"
+		,sum(case when ti."Дозвон" = 0 then "Продолжительность задачи" else 0 end)*1.0 /
+			sum("Продолжительность задачи") as "Время на задачи с недозвоном"
+		,sum("Был проект")*1.0/(case when ti."Канал" = 'Исходящий' 
+									 then count(case when ti."Дозвон" = 1 and ti."Деактивирована" = 0 then task else null end)
+									 when ti."Канал" = 'Звонки'
+									 then count(case when ti."Деактивирована" = 0 and task > 0 then task else null end)
+									 else count(case when ti."Деактивирована" = 0 then task else null end) end) as "Конверсия из закрытой задачи в проект"
+		,case 
+			when sum("Был проект") = 0
+			then 0
+			else sum("Наличие встречи")*1.0/sum("Был проект") 
+		end as "Доля проектов со встречей"
+	from 
+		"tt_itog2" ti 
+	group by 
+		ti."Канал"
+		,"Грейд"
+;
+--================================================================
+--Считаем конверсию из проекта в передачу
+--================================================================
+
+drop table if exists "tt_conv";
+create temp table "tt_conv" as
+with a as 
+(select distinct 
+		 it."Канал"
+		,it.project_id
+		,it."Повторность"
+		,ca."ProjectId" 
+		,case when tt."ProjectId" is not null then 1 else 0 end as "Передан прямой проект ДКС"
+		,case when tt2."ProjectId" is not null then 1 else 0 end as "Передан Перезаведенный проект ДКС"
+	from 
+		"tt_itog" it 
+	left join 
+		dwh."ProjectMarketingCommunicationChannelAttribution" ca 
+	on ca."OriginalProjectId" = it.project_id 
+	left join 
+		(select distinct dl."ProjectId" 
+			from dwh."IC_ДоговорЛизинга" dl
+			where dl."ДатаПередачи"  is not null
+			and dl."ProjectId" is not null
+				) tt 
+	on tt."ProjectId" = it.project_id
+	left join 
+		(select distinct dl."ProjectId" 
+			from dwh."IC_ДоговорЛизинга" dl
+			where dl."ДатаПередачи"  is not null
+			and dl."ProjectId" is not null
+				) tt2 
+	on tt2."ProjectId" = ca."ProjectId"
+)
+select distinct
+		 a."Канал"
+		,a.project_id
+		,a."Повторность"
+		,max(case when a."Передан прямой проект ДКС" = 1 or a."Передан Перезаведенный проект ДКС" = 1 then 1 else 0 end) as "Передан"			
+	from a
+	where a.project_id is not null
+	group by
+		 a."Канал"
+		,a.project_id
+		,a."Повторность"
+;
+
+drop table if exists "tt_conv_Final";
+create temp table "tt_conv_Final" as
+select 
+		 a."Канал"
+		,a."Повторность"
+		,sum("Передан")*1.0/count(*) as "Конверсия из проекта в передачу"
+	from 	
+		"tt_conv" a 
+	group by 
+		 a."Канал"
+		,a."Повторность"
+	order by 
+		a."Канал"
+		,a."Повторность"
+;
+--================================================================
+--Считаем конверсию из проекта в передачу + месяц
+--================================================================
+
+drop table if exists "tt_conv2";
+create temp table "tt_conv2" as
+with a as 
+(select distinct 
+		 it."Канал"
+		 ,"Грейд"
+		,cast(date_trunc('month', it.created_at) as date) as "Месяц"
+		,it.project_id
+		,it."Повторность"
+		,ca."ProjectId" 
+		,case when tt."ProjectId" is not null then 1 else 0 end as "Передан прямой проект ДКС"
+		,case when tt2."ProjectId" is not null then 1 else 0 end as "Передан Перезаведенный проект ДКС"
+	from 
+		"tt_itog2" it 
+	left join 
+		dwh."ProjectMarketingCommunicationChannelAttribution" ca 
+	on ca."OriginalProjectId" = it.project_id 
+	left join 
+		(select distinct dl."ProjectId" 
+			from dwh."IC_ДоговорЛизинга" dl
+			where dl."ДатаПередачи"  is not null
+			and dl."ProjectId" is not null
+				) tt 
+	on tt."ProjectId" = it.project_id
+	left join 
+		(select distinct dl."ProjectId" 
+			from dwh."IC_ДоговорЛизинга" dl
+			where dl."ДатаПередачи"  is not null
+			and dl."ProjectId" is not null
+				) tt2 
+	on tt2."ProjectId" = ca."ProjectId"
+)
+select distinct
+		 a."Канал"
+		 ,"Грейд"
+		,a."Месяц"
+		,a.project_id
+		,a."Повторность"
+		,max(case when a."Передан прямой проект ДКС" = 1 or a."Передан Перезаведенный проект ДКС" = 1 then 1 else 0 end) as "Передан"			
+	from a
+	where a.project_id is not null
+	group by
+		 a."Канал"
+		 ,"Грейд"
+		,a."Месяц"
+		,a.project_id
+		,a."Повторность"
+;
+
+--================================================================
+--Считаем конверсию из проекта в передачу + месяц (исп отдельно, для демонстрации статистики)
+--================================================================
+
+
+--drop table if exists "tt_conv_for_statistic";
+--create temp table "tt_conv_for_statistic" as
+select 
+		 a."Канал"
+		 ,"Грейд"
+		--,a."Месяц"
+		,a."Повторность"
+		,sum("Передан")*1.0/count(*) as "Конверсия из проекта в передачу"
+	from 	
+		"tt_conv2" a 
+	group by 
+		 a."Канал"
+		 ,"Грейд"
+		--,a."Месяц"
+		,a."Повторность"
+	order by 
+		a."Канал"
+		 ,"Грейд"
+		--,a."Месяц"
+		,a."Повторность"
+;
+
+--================================================================
+--Считаем кол-во рабочих часов в каждом месяце
+--================================================================
+
+drop table if exists "tt_days";
+create temp table "tt_days" as
+select  distinct
+		cast(date_trunc('month', "ДатаКалендарная") as date) as "Месяц",
+		count( distinct "ДатаКалендарная") as work_days
+	from
+		ic."РегистрСведений_Календарь"
+	where
+			"ТипКалендаря" = '\x80987F73EB87F71044815D1BFFF84D4C'
+		and "КоличествоЧасов" > 1
+		and "ДатаКалендарная" between '2024-01-01' and '2025-01-01'
+	group by date_trunc('month', "ДатаКалендарная");
+
+--================================================================
+--Агрегируем до таски+грейда оператора
+--================================================================
+--40 - 50 звонки 15 исход
+--Исходя с дозвон в проект
+--(Кол-во переданных с прямых + Кол-во переданных с перезаведенных, но без передачи по прямому)/Кол-во прямых
+drop table if exists "tt_export";
+create temp table "tt_export" as
+select distinct
+	f."Канал"
+	,f."Грейд"
+	--,f."Месяц"
+	,f."Время на задачу без проекта с дозвоном"
+	,f."Время на задачу с проектом"
+	,f."Время на деактивированные задачи"
+	,f."Время на задачи с недозвоном"
+	,fy."Конверсия из закрытой задачи в проект"
+	,f."Доля проектов со встречей"
+	,null as "Конверсия в передачу"
+	,cf1."Конверсия из проекта в передачу" as "Конверсия в передачу, повтор"
+	,cf2."Конверсия из проекта в передачу" as "Конверсия в передачу, новые"
+	--,td.work_days
+from 
+	"Final" f
+	left join "Final_year" fy
+		on f."Канал" = fy."Канал"
+	left join "tt_conv_Final" cf1
+		on 
+			cf1."Канал" = f."Канал"
+			and cf1."Повторность" = 'Повторный'
+	left join "tt_conv_Final" cf2
+		on 
+			cf2."Канал" = f."Канал"
+			and cf2."Повторность" = 'Новый'
+	--join "tt_days" td
+		--on extract(month from td."Месяц") = extract(month from f."Месяц")
