@@ -1,112 +1,73 @@
 --================================================================
--- МК: на какой попытке дозвона заводится проект (исходящий канал)
--- Группа закрывается ДОЗВОНОМ; счётчик сбрасывается со следующей группы.
--- Лимит попыток НЕ хардкодится — хвостовая группа недозвонов
--- сама отражает физический лимит МК (3, 4, ...), т.к. он уже в данных.
--- Для смены МК меняется только campaign id — больше ничего.
--- Дозвон/недозвон — по правилу из памятки (class=9 или status=59 = недозвон).
+-- Отчёт по МК 204 (исходящий): на какой попытке дозвона заводится проект
+-- Источник истины по попыткам — dcc."FT_efficiency_of_dialing_attempts"()
+-- (продакшен-функция, отчёт "Эффективность МПП"). Собственную нарезку
+-- на группы НЕ делаем — берём dailing_indicator из функции.
 -- Фильтр: дата завершения задачи >= 17.06.2026
 --================================================================
 
 with
 
-params as (
-    select 204 as campaign_id            -- <<< единственное, что меняется под другую МК
-),
-
 t204 as (
+    -- задачи МК 204, исходящий канал
     select
-         lt."id"          as "TaskId"
-        ,lt."created_at"  as "Дата создания задачи"
+         lt."id"          as task
+        ,lt."created_at"  as created_at
     from voipclient."leasing_task" lt
         join voipclient."leasing_campaign" lc on lc."id" = lt."campaign"
-        cross join params p
-    where lt."campaign" = p.campaign_id
-      and lc."type" = 1                   -- исходящий канал
+    where lt."campaign" = 204
+      and lc."type" = 1
 ),
 
-attempts as (
-    -- каждая итерация = попытка; дозвон/недозвон строго по памятке
-    select
-         li."task"        as "TaskId"
-        ,li."id"          as "InteractionId"
-        ,li."started"
-        ,li."ended"
-        ,li."project_id"
-        ,case
-            when (cs."class" <> 9 and li."status" <> 59)
-              or (cs."class" is null and li."status" is null)
-            then 1 else 0
-         end as "Дозвон"
-        ,row_number() over (partition by li."task"
-                            order by li."started", li."id") as "seq"
+task_end as (
+    -- дата завершения задачи = последняя итерация
+    select li."task" as task, max(li."ended") as ended
     from voipclient."leasing_interaction" li
-        join t204 t on t."TaskId" = li."task"
-        left join voipclient."configuration_status" cs on cs."id" = li."status"
-    where li."started" is not null
+        join t204 t on t.task = li."task"
+    group by li."task"
 ),
 
-grp as (
-    -- номер группы = сколько дозвонов уже закрылось ДО этой строки
+fn as (
+    -- вызов производственной функции, оставляем только МК 204
+    select f.task, f.project, f.dailing_indicator
+    from dcc."FT_efficiency_of_dialing_attempts"() f
+    where f.campaign = 204
+),
+
+fn_agg as (
+    -- сворачиваем функцию до задачи
     select
-         a.*
-        ,coalesce(sum(a."Дозвон") over (
-             partition by a."TaskId" order by a."seq"
-             rows between unbounded preceding and 1 preceding), 0) as "Номер группы"
-    from attempts a
+         f.task
+        ,max(case when f.project is not null then 1 else 0 end)            as has_project
+        ,max(case when f.project is not null then f.dailing_indicator end) as dialing_at_project  -- попытка, на которой завёлся проект
+        ,max(f.dailing_indicator)                                          as dialing_max         -- полный размах попыток (для задач без проекта)
+    from fn f
+    group by f.task
 ),
 
-grp2 as (
-    -- позиция попытки внутри её группы
-    select
-         g.*
-        ,row_number() over (partition by g."TaskId", g."Номер группы"
-                            order by g."seq") as "Попытка в группе"
-    from grp g
-),
-
-proj_row as (
-    -- попытка (внутри группы), на которой ВПЕРВЫЕ появился проект
-    select distinct on (g."TaskId")
-         g."TaskId", g."project_id"
-        ,g."Попытка в группе" as "Попытка проекта"
-    from grp2 g
-    where g."project_id" is not null
-    order by g."TaskId", g."seq"
-),
-
-last_row as (
-    -- размер последней группы (для задач без проекта)
-    select distinct on (g."TaskId")
-         g."TaskId"
-        ,g."Попытка в группе" as "Попытка последней группы"
-    from grp2 g
-    order by g."TaskId", g."seq" desc
-),
-
-agg as (
-    select
-         t."TaskId", t."Дата создания задачи"
-        ,max(g."ended")                                              as "Дата завершения задачи"
-        ,max(case when g."project_id" is not null then 1 else 0 end) as "Факт заведения проекта"
-    from grp2 g
-        join t204 t on t."TaskId" = g."TaskId"
-    group by t."TaskId", t."Дата создания задачи"
+proj as (
+    -- реальный номер проекта (функция даёт только флаг = task_id)
+    select distinct on (li."task")
+         li."task"        as task
+        ,li."project_id"  as project_id
+    from voipclient."leasing_interaction" li
+        join t204 t on t.task = li."task"
+    where li."project_id" is not null
+    order by li."task", li."started"
 )
 
 select
-     ag."Дата создания задачи"::date    as "Дата создания задачи"
-    ,ag."Дата завершения задачи"::date  as "Дата завершения задачи"
-    ,ag."TaskId"                        as "Номер задачи"
-    ,coalesce(pr."Попытка проекта", lr."Попытка последней группы")
-                                        as "Количество попыток дозвона"
-    ,ag."Факт заведения проекта"
-    ,coalesce(sp."Номер проекта", pr."project_id")
-                                        as "Номер проекта"
-from agg ag
-    left join proj_row pr on pr."TaskId" = ag."TaskId"
-    left join last_row  lr on lr."TaskId" = ag."TaskId"
-    left join dwh."SAFO_Project" sp on sp."Номер проекта" = pr."project_id"
-where ag."Дата завершения задачи" >= '2026-06-17'
-order by ag."Дата завершения задачи" desc
+     t.created_at::date                              as "Дата создания задачи"
+    ,te.ended::date                                  as "Дата завершения задачи"
+    ,t.task                                          as "Номер задачи"
+    ,coalesce(fa.dialing_at_project, fa.dialing_max) as "Количество попыток дозвона"
+    ,coalesce(fa.has_project, 0)                     as "Факт заведения проекта"
+    ,coalesce(sp."Номер проекта", pr.project_id)     as "Номер проекта"
+from t204 t
+    left join task_end te on te.task = t.task
+    left join fn_agg  fa on fa.task = t.task
+    left join proj    pr on pr.task = t.task
+    left join dwh."SAFO_Project" sp on sp."Номер проекта" = pr.project_id
+where te.ended >= '2026-06-17'
+order by te.ended desc
 ;
