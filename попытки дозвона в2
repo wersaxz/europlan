@@ -1,24 +1,28 @@
 --================================================================
--- МК 204 (исходящий): на какой попытке дозвона заводится проект
--- Попытки режутся на ГРУППЫ. Группа закрывается ДОЗВОНОМ (клиент взял трубку)
--- либо блоком номера на 4-й попытке автодозвона (лимит МК 204 = 4).
--- Счётчик попыток сбрасывается в начале каждой новой группы.
--- Для задач БЕЗ проекта выводится размер последней группы.
+-- МК: на какой попытке дозвона заводится проект (исходящий канал)
+-- Группа закрывается ДОЗВОНОМ; счётчик сбрасывается со следующей группы.
+-- Лимит попыток НЕ хардкодится — хвостовая группа недозвонов
+-- сама отражает физический лимит МК (3, 4, ...), т.к. он уже в данных.
+-- Для смены МК меняется только campaign id — больше ничего.
 -- Дозвон/недозвон — по правилу из памятки (class=9 или status=59 = недозвон).
 -- Фильтр: дата завершения задачи >= 17.06.2026
 --================================================================
 
-with recursive
+with
+
+params as (
+    select 204 as campaign_id            -- <<< единственное, что меняется под другую МК
+),
 
 t204 as (
     select
          lt."id"          as "TaskId"
         ,lt."created_at"  as "Дата создания задачи"
     from voipclient."leasing_task" lt
-        join voipclient."leasing_campaign" lc
-            on lc."id" = lt."campaign"
-    where lt."campaign" = 204
-      and lc."type" = 1
+        join voipclient."leasing_campaign" lc on lc."id" = lt."campaign"
+        cross join params p
+    where lt."campaign" = p.campaign_id
+      and lc."type" = 1                   -- исходящий канал
 ),
 
 attempts as (
@@ -42,35 +46,23 @@ attempts as (
     where li."started" is not null
 ),
 
-grouped as (
+grp as (
+    -- номер группы = сколько дозвонов уже закрылось ДО этой строки
     select
-         a."TaskId", a."InteractionId", a."seq", a."started", a."ended"
-        ,a."Дозвон", a."project_id"
-        ,1 as "Попытка в группе"
-        ,1 as "Номер группы"
-        ,case when a."Дозвон" = 1 or 1 >= 4 then 1 else 0 end as "Группа закрыта"
+         a.*
+        ,coalesce(sum(a."Дозвон") over (
+             partition by a."TaskId" order by a."seq"
+             rows between unbounded preceding and 1 preceding), 0) as "Номер группы"
     from attempts a
-    where a."seq" = 1
+),
 
-    union all
-
+grp2 as (
+    -- позиция попытки внутри её группы
     select
-         a."TaskId", a."InteractionId", a."seq", a."started", a."ended"
-        ,a."Дозвон", a."project_id"
-        ,case when g."Группа закрыта" = 1 then 1
-              else g."Попытка в группе" + 1 end                       as "Попытка в группе"
-        ,case when g."Группа закрыта" = 1 then g."Номер группы" + 1
-              else g."Номер группы" end                               as "Номер группы"
-        ,case
-            when a."Дозвон" = 1 then 1                                 -- дозвон закрывает группу
-            when (case when g."Группа закрыта" = 1 then 1
-                       else g."Попытка в группе" + 1 end) >= 4 then 1  -- блок на 4-й попытке
-            else 0
-         end as "Группа закрыта"
-    from attempts a
-        join grouped g
-            on g."TaskId" = a."TaskId"
-           and a."seq" = g."seq" + 1
+         g.*
+        ,row_number() over (partition by g."TaskId", g."Номер группы"
+                            order by g."seq") as "Попытка в группе"
+    from grp g
 ),
 
 proj_row as (
@@ -78,7 +70,7 @@ proj_row as (
     select distinct on (g."TaskId")
          g."TaskId", g."project_id"
         ,g."Попытка в группе" as "Попытка проекта"
-    from grouped g
+    from grp2 g
     where g."project_id" is not null
     order by g."TaskId", g."seq"
 ),
@@ -88,7 +80,7 @@ last_row as (
     select distinct on (g."TaskId")
          g."TaskId"
         ,g."Попытка в группе" as "Попытка последней группы"
-    from grouped g
+    from grp2 g
     order by g."TaskId", g."seq" desc
 ),
 
@@ -97,7 +89,7 @@ agg as (
          t."TaskId", t."Дата создания задачи"
         ,max(g."ended")                                              as "Дата завершения задачи"
         ,max(case when g."project_id" is not null then 1 else 0 end) as "Факт заведения проекта"
-    from grouped g
+    from grp2 g
         join t204 t on t."TaskId" = g."TaskId"
     group by t."TaskId", t."Дата создания задачи"
 )
