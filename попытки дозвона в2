@@ -1,19 +1,5 @@
-select
-     f.task
-    ,f.campaign
-    ,f.dailing_indicator
-    ,count(*) as cnt
-from dcc."FT_efficiency_of_dialing_attempts"() f
-where f.task = 21742772
-group by f.task, f.campaign, f.dailing_indicator
-order by f.campaign, f.dailing_indicator;
-
-
-select
-     task
-    ,max(dailing_indicator)     as max_ind
-    ,max(dailing_indicator) + 1 as итог
-    ,count(*)                   as строк
+select task, campaign, project, starttime, dailing_indicator
 from dcc."FT_efficiency_of_dialing_attempts"()
-where campaign = 204 and task = 21742772
-group by task;
+where campaign = 204
+  and task = <любая задача, где Факт заведения проекта = 1>
+order by starttime;
