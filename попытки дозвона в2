@@ -1,11 +1,127 @@
-select count(*) as "Попыток без лимита из истории"
-from voipclient."leasing_interaction" li
-    join voipclient."leasing_task" lt on lt."id" = li."task"
-    left join (
-        select "campaign","count_attempts"
-            ,case when row_number() over (partition by "campaign" order by "updated_at")=1
-                  then '-infinity'::timestamp else "updated_at" end as date_from
-            ,coalesce(lead("updated_at") over (partition by "campaign" order by "updated_at"),'infinity'::timestamp) as date_to
-        from voipclient."leasing_campaign_history" where "count_attempts">0
-    ) lh on lh."campaign"=lt."campaign" and li."started">=lh.date_from and li."started"<lh.date_to
-where lt."campaign"=204 and li."started" is not null and lh."count_attempts" is null;
+--================================================================
+-- МК 204 (исходящий): на какой попытке дозвона заводится проект
+-- Лимит попыток в группе = count_attempts из leasing_campaign_history
+--   НА МОМЕНТ попытки. Никаких констант в коде — лимит только из настроек МК.
+-- Группа закрывается ДОЗВОНОМ либо по достижении count_attempts.
+-- Дозвон/недозвон: configuration_class.name = 'leasing.call_failed' = недозвон.
+-- "Количество попыток дозвона" = попытка в группе, где завёлся проект;
+--   без проекта = макс. попыток в группе (обе ≤ count_attempts).
+-- Фильтр: дата завершения задачи >= 17.06.2026
+--================================================================
+
+with recursive
+
+params as (select 204 as campaign_id),
+
+limit_hist as (
+    -- версии count_attempts с интервалами действия;
+    -- первая версия действует с -бесконечности (чтобы лимит нашёлся ВСЕГДА)
+    select
+         lch."campaign"
+        ,lch."count_attempts"
+        ,case
+            when row_number() over (partition by lch."campaign" order by lch."updated_at") = 1
+            then '-infinity'::timestamp                       -- первая версия — назад до начала времён
+            else lch."updated_at"
+         end                                                  as date_from
+        ,coalesce(lead(lch."updated_at") over (partition by lch."campaign"
+                                               order by lch."updated_at")
+                 ,'infinity'::timestamp)                      as date_to
+    from voipclient."leasing_campaign_history" lch cross join params p
+    where lch."campaign" = p.campaign_id
+      and lch."count_attempts" > 0
+),
+
+base as (
+    select lt."id" as task, lt."created_at" as created_at
+    from voipclient."leasing_task" lt
+        join voipclient."leasing_campaign" lc on lc."id" = lt."campaign"
+    where lt."campaign" = 204
+      and lc."type" = 1
+),
+
+attempts as (
+    select
+         li."task"        as task
+        ,li."id"          as iid
+        ,li."started"
+        ,li."ended"
+        ,li."project_id"
+        ,case when cc."name" = 'leasing.call_failed' then 0 else 1 end as dozvon
+        ,row_number() over (partition by li."task"
+                            order by li."started", li."id")     as seq
+        ,lh."count_attempts"                                    as lim   -- лимит только из настроек МК
+    from voipclient."leasing_interaction" li
+        join base b on b.task = li."task"
+        left join voipclient."configuration_status" cs on cs."id" = li."status"
+        left join voipclient."configuration_class"  cc on cs."class" = cc."id"
+        join limit_hist lh                                              -- INNER: у попытки всегда есть лимит из истории
+               on li."started" >= lh.date_from
+              and li."started" <  lh.date_to
+    where li."started" is not null
+),
+
+walk as (
+    select
+         a.task, a.iid, a.seq, a."started", a."ended", a.dozvon, a.project_id, a.lim
+        ,1 as att_in_grp
+        ,1 as grp
+        ,case when a.dozvon = 1 or 1 >= a.lim then 1 else 0 end as closed
+    from attempts a
+    where a.seq = 1
+
+    union all
+
+    select
+         a.task, a.iid, a.seq, a."started", a."ended", a.dozvon, a.project_id, a.lim
+        ,case when w.closed = 1 then 1 else w.att_in_grp + 1 end as att_in_grp
+        ,case when w.closed = 1 then w.grp + 1 else w.grp end    as grp
+        ,case
+            when a.dozvon = 1 then 1
+            when (case when w.closed = 1 then 1 else w.att_in_grp + 1 end) >= a.lim then 1
+            else 0
+         end as closed
+    from attempts a
+        join walk w on w.task = a.task and a.seq = w.seq + 1
+),
+
+at_project as (
+    select distinct on (task)
+         task, att_in_grp as att_project
+    from walk
+    where project_id is not null
+    order by task, seq
+),
+
+task_metrics as (
+    select
+         task
+        ,max(att_in_grp)                                         as att_max
+        ,max("ended")                                           as ended
+        ,max(case when project_id is not null then 1 else 0 end) as has_project
+    from walk
+    group by task
+),
+
+proj as (
+    select distinct on (task) task, project_id
+    from walk
+    where project_id is not null
+    order by task, seq
+)
+
+select
+     b.created_at::date                             as "Дата создания задачи"
+    ,tm.ended::date                                 as "Дата завершения задачи"
+    ,b.task                                         as "Номер задачи"
+    ,coalesce(ap.att_project, tm.att_max)           as "Количество попыток дозвона"
+    ,tm.has_project                                 as "Факт заведения проекта"
+    ,coalesce(sp."Номер проекта", pr.project_id)    as "Номер проекта"
+from base b
+    join task_metrics tm on tm.task = b.task
+    left join at_project ap on ap.task = b.task
+    left join proj       pr on pr.task = b.task
+    left join dwh."SAFO_Project" sp on sp."Номер проекта" = pr.project_id
+where tm.ended >= '2026-06-17'
+order by tm.ended desc
+;
