@@ -1,5 +1,97 @@
+--================================================================
+-- МК 204 (исходящий): на какой попытке дозвона заводится проект
+-- Источник истины — dcc."FT_efficiency_of_dialing_attempts"().
+-- "Количество попыток дозвона" = dailing_indicator НА СТРОКЕ ПРОЕКТА
+--   (если проект есть), иначе — на ПОСЛЕДНЕЙ попытке задачи.
+--   НЕ max по задаче (max раздувается на сериях "перезвоните позже").
+-- Функция считает с нуля → +1 для человеческого счёта.
+-- Фильтр: дата завершения задачи >= 17.06.2026
+--================================================================
+
+drop table if exists tmp_fn;
+create temp table tmp_fn as
 select task, campaign, project, starttime, dailing_indicator
-from dcc."FT_efficiency_of_dialing_attempts"()
-where campaign = 204
-  and task = <любая задача, где Факт заведения проекта = 1>
-order by starttime;
+from dcc."FT_efficiency_of_dialing_attempts"();
+create index on tmp_fn (campaign, task);
+
+with
+
+base as (
+    select lt."id" as task, lt."created_at" as created_at
+    from voipclient."leasing_task" lt
+        join voipclient."leasing_campaign" lc on lc."id" = lt."campaign"
+    where lt."campaign" = 204
+      and lc."type" = 1
+),
+
+fn204 as (
+    -- строки функции по МК 204 + номер строки от конца (для выбора последней)
+    select
+         f.task
+        ,f.project
+        ,f.starttime
+        ,f.dailing_indicator
+        ,row_number() over (partition by f.task order by f.starttime desc) as rn_last
+    from tmp_fn f
+    where f.campaign = 204
+),
+
+-- строка, на которой завёлся проект (первая такая, если их несколько)
+row_proj as (
+    select distinct on (task)
+         task
+        ,dailing_indicator as ind_at_project
+        ,project           as project_flag
+    from fn204
+    where project is not null
+    order by task, starttime
+),
+
+-- последняя попытка задачи (для задач без проекта)
+row_last as (
+    select task, dailing_indicator as ind_at_last
+    from fn204
+    where rn_last = 1
+),
+
+fn_agg as (
+    select
+         l.task
+        ,coalesce(p.ind_at_project, l.ind_at_last) + 1  as "Количество попыток дозвона"  -- +1: функция с 0
+        ,case when p.task is not null then 1 else 0 end as has_project
+    from row_last l
+        left join row_proj p on p.task = l.task
+),
+
+task_end as (
+    select li."task" as task, max(li."ended") as ended
+    from voipclient."leasing_interaction" li
+        join base b on b.task = li."task"
+    group by li."task"
+),
+
+proj as (
+    -- реальный номер проекта (функция даёт флаг = task_id)
+    select distinct on (li."task")
+         li."task" as task, li."project_id" as project_id
+    from voipclient."leasing_interaction" li
+        join base b on b.task = li."task"
+    where li."project_id" is not null
+    order by li."task", li."started"
+)
+
+select
+     b.created_at::date                             as "Дата создания задачи"
+    ,te.ended::date                                 as "Дата завершения задачи"
+    ,b.task                                         as "Номер задачи"
+    ,fa."Количество попыток дозвона"
+    ,coalesce(fa.has_project, 0)                    as "Факт заведения проекта"
+    ,coalesce(sp."Номер проекта", pr.project_id)    as "Номер проекта"
+from base b
+    join task_end te on te.task = b.task
+    left join fn_agg fa on fa.task = b.task
+    left join proj   pr on pr.task = b.task
+    left join dwh."SAFO_Project" sp on sp."Номер проекта" = pr.project_id
+where te.ended >= '2026-06-17'
+order by te.ended desc
+;
