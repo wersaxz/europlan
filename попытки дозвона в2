@@ -1,40 +1,11 @@
-with recursive
-params as (select 204 as campaign_id),
-limit_hist as (
-    select lch."campaign", lch."count_attempts"
-        ,lch."updated_at" as date_from
-        ,coalesce(lead(lch."updated_at") over (partition by lch."campaign" order by lch."updated_at"),'infinity'::timestamp) as date_to
-    from voipclient."leasing_campaign_history" lch cross join params p
-    where lch."campaign"=p.campaign_id and lch."count_attempts">0
-),
-attempts as (
-    select li."task" as task, li."id" as iid, li."started", li."project_id"
-        ,case when cc."name" = 'leasing.call_failed' then 0 else 1 end as dozvon
-        ,row_number() over (partition by li."task" order by li."started", li."id") as seq
-        ,coalesce(lh."count_attempts",4) as lim
-    from voipclient."leasing_interaction" li
-        join voipclient."leasing_task" lt on lt."id"=li."task"
-        cross join params p
-        left join voipclient."configuration_status" cs on cs."id"=li."status"
-        left join voipclient."configuration_class"  cc on cs."class"=cc."id"
-        left join limit_hist lh on li."started">=lh.date_from and li."started"<lh.date_to
-    where lt."campaign"=p.campaign_id and li."started" is not null
-),
-walk as (
-    select a.task,a.iid,a.seq,a."started",a.dozvon,a.project_id,a.lim
-        ,1 as att_in_grp, 1 as grp
-        ,case when a.dozvon=1 or 1>=a.lim then 1 else 0 end as closed
-    from attempts a where a.seq=1
-    union all
-    select a.task,a.iid,a.seq,a."started",a.dozvon,a.project_id,a.lim
-        ,case when w.closed=1 then 1 else w.att_in_grp+1 end
-        ,case when w.closed=1 then w.grp+1 else w.grp end
-        ,case when a.dozvon=1 then 1
-              when (case when w.closed=1 then 1 else w.att_in_grp+1 end)>=a.lim then 1
-              else 0 end
-    from attempts a join walk w on w.task=a.task and a.seq=w.seq+1
-)
-select seq, "started"::timestamp, dozvon, lim, grp, att_in_grp, closed, project_id
-from walk
-where task = 21611323
-order by seq;
+select count(*) as "Попыток без лимита из истории"
+from voipclient."leasing_interaction" li
+    join voipclient."leasing_task" lt on lt."id" = li."task"
+    left join (
+        select "campaign","count_attempts"
+            ,case when row_number() over (partition by "campaign" order by "updated_at")=1
+                  then '-infinity'::timestamp else "updated_at" end as date_from
+            ,coalesce(lead("updated_at") over (partition by "campaign" order by "updated_at"),'infinity'::timestamp) as date_to
+        from voipclient."leasing_campaign_history" where "count_attempts">0
+    ) lh on lh."campaign"=lt."campaign" and li."started">=lh.date_from and li."started"<lh.date_to
+where lt."campaign"=204 and li."started" is not null and lh."count_attempts" is null;
