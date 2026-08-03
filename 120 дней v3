@@ -1,0 +1,117 @@
+--================================================================
+-- Перезаведённые проекты: пара "исходящий ДКС" → "Поставщик/Альфа банк".
+-- Пары ищутся сначала, тяжёлые джойны применяются только к найденным парам.
+-- Для ОБОИХ проектов: статус, этап, причина архива, комментарий,
+-- последняя дата работы, подразделение. + подразделение МПП по проекту ДКС.
+--================================================================
+
+with
+
+dks_base as (
+    -- ID проектов исходящего ДКС
+    select distinct li."project_id"
+    from voipclient."leasing_interaction" li
+        join voipclient."leasing_task" lt on lt."id" = li."task"
+        join voipclient."leasing_campaign" lc on lc."id" = lt."campaign"
+    where lc."type" = 1
+      and li."project_id" is not null
+),
+
+p_alfa as (
+    -- проекты Альфа-банка (Поставщик + Альфа банк)
+    select
+         sp."Номер проекта"          as alfa_project
+        ,sp."CtaRepositoryId"
+        ,sp."BranchId"
+        ,sp."Дата создания проекта"  as alfa_date
+    from dwh."SAFO_Project" sp
+    where sp."Группа источника обращения"       = 'Поставщик'
+      and sp."Наименование источника обращения" = 'Альфа банк'
+),
+
+project_pairs as (
+    -- целевые пары: один клиент+филиал, Альфа не раньше ДКС и в пределах 120 дней
+    select
+         sp."Номер проекта"         as dks_project
+        ,p_alfa.alfa_project
+        ,sp."Дата создания проекта" as dks_date
+        ,p_alfa.alfa_date
+        ,sp."CtaRepositoryId"
+        ,sp."BranchId"
+    from dwh."SAFO_Project" sp
+        join dks_base d on d.project_id = sp."Номер проекта"
+        join p_alfa
+            on p_alfa."CtaRepositoryId" = sp."CtaRepositoryId"
+           and p_alfa."BranchId"        = sp."BranchId"
+           and p_alfa.alfa_date >= sp."Дата создания проекта"
+           and p_alfa.alfa_date <  sp."Дата создания проекта" + interval '120 days'
+),
+
+-- все номера проектов, по которым дальше нужны атрибуты (ДКС + Альфа)
+target_projects as (
+    select dks_project  as project from project_pairs
+    union
+    select alfa_project as project from project_pairs
+),
+
+-- подразделение МПП, заведшего проект ДКС
+dks_mpp as (
+    select distinct on (li."project_id")
+         li."project_id"
+        ,sotr."Подразделение" as "Подразделение МПП"
+    from (select distinct dks_project from project_pairs) pp
+        join voipclient."leasing_interaction" li on li."project_id" = pp.dks_project
+        left join voipclient."configuration_operator" op on op."id" = li."operator"
+        left join dwh."Сотрудники" sotr
+            on sotr."Логин" = op."login"
+           and li."started" > sotr."DateFrom"
+           and li."started" < sotr."DateTo"
+    order by li."project_id", li."started"
+),
+
+-- последняя запись лога статусов (причина архива + комментарий + дата) — по нужным проектам
+archive_info as (
+    select distinct on (psl."ProjectId")
+         psl."ProjectId"
+        ,rr."Name"        as "Причина архива"
+        ,psl."Description" as "Комментарий при архивации"
+        ,psl."CreatedAt"   as "Последняя дата работы"
+    from safo."Projects_StatusLog" psl
+        join target_projects tp on tp.project = psl."ProjectId"
+        left join safo."Projects_RejectionReason" rr on rr."id" = psl."RejectionReasonId"
+    order by psl."ProjectId", psl."CreatedAt" desc      -- последняя запись по проекту
+)
+
+select
+     pp.dks_project                          as "Номер проекта исходящего ДКС"
+    ,pp.alfa_project                         as "Номер проекта Альфа банка"
+    ,pp.dks_date::date                       as "Дата заведения проекта исходящего ДКС"
+    ,pp.alfa_date::date                      as "Дата заведения проекта Альфа банка"
+
+    -- === проект исходящего ДКС ===
+    ,sp_dks."Статус"                         as "Текущий статус ДКС"
+    ,sp_dks."Этап"                           as "Текущий этап ДКС"
+    ,ai_dks."Причина архива"                 as "Причина архива ДКС"
+    ,ai_dks."Комментарий при архивации"      as "Комментарий при архивации ДКС"
+    ,ai_dks."Последняя дата работы"::date    as "Последняя дата работы ДКС"
+    ,sp_dks."Подразделение"                  as "Подразделение ДКС"
+
+    -- === проект Альфа-банка ===
+    ,sp_alfa."Статус"                        as "Текущий статус Альфа"
+    ,sp_alfa."Этап"                          as "Текущий этап Альфа"
+    ,ai_alfa."Причина архива"                as "Причина архива Альфа"
+    ,ai_alfa."Комментарий при архивации"     as "Комментарий при архивации Альфа"
+    ,ai_alfa."Последняя дата работы"::date   as "Последняя дата работы Альфа"
+    ,sp_alfa."Подразделение"                 as "Подразделение Альфа"
+
+    -- === подразделение МПП (оператор, заведший ДКС) ===
+    ,mpp."Подразделение МПП"
+
+from project_pairs pp
+    left join dwh."SAFO_Project" sp_dks  on sp_dks."Номер проекта"  = pp.dks_project
+    left join archive_info      ai_dks   on ai_dks."ProjectId"      = pp.dks_project
+    left join dwh."SAFO_Project" sp_alfa on sp_alfa."Номер проекта" = pp.alfa_project
+    left join archive_info      ai_alfa  on ai_alfa."ProjectId"     = pp.alfa_project
+    left join dks_mpp           mpp      on mpp."project_id"        = pp.dks_project
+order by pp.dks_date desc
+;
