@@ -1,0 +1,73 @@
+with
+
+-- 1. Собираем только ID проектов исходящего ДКС (без тяжелых джойнов с логами и кадрами)
+dks_base as (
+    select distinct li."project_id"
+    from voipclient."leasing_interaction" li
+        join voipclient."leasing_task" lt 
+            on lt."id" = li."task"
+        join voipclient."leasing_campaign" lc 
+            on lc."id" = lt."campaign"
+    where lc."type" = 1 
+      and li."project_id" is not null
+),
+
+-- 2. Отбираем проекты Альфа-банка
+p_alfa as (
+    select
+         sp."Номер проекта"          as alfa_project
+        ,sp."CtaRepositoryId"
+        ,sp."BranchId"
+        ,sp."Дата создания проекта"  as alfa_date
+    from dwh."SAFO_Project" sp
+    where sp."Группа источника обращения"       = 'Поставщик'
+      and sp."Наименование источника обращения" = 'Альфа банк'
+),
+
+-- 3. Находим целевые пары (на этом этапе остаются только реально нужные нам проекты)
+project_pairs as (
+    select
+         sp."Номер проекта"         as dks_project
+        ,p_alfa.alfa_project
+        ,sp."Дата создания проекта" as dks_date
+        ,p_alfa.alfa_date
+        ,sp."CtaRepositoryId"
+        ,sp."BranchId"
+    from dwh."SAFO_Project" sp
+        join dks_base d 
+            on d.project_id = sp."Номер проекта"
+        join p_alfa
+            on p_alfa."CtaRepositoryId" = sp."CtaRepositoryId"
+           and p_alfa."BranchId"        = sp."BranchId"
+           and p_alfa.alfa_date >= sp."Дата создания проекта"
+           and p_alfa.alfa_date <  sp."Дата создания проекта" + interval '120 days'
+),
+
+-- 4. Ищем подразделение ТОЛЬКО для проектов ДКС, у которых нашлась пара в Альфе
+dks_mpp as (
+    select distinct on (li."project_id")
+         li."project_id"
+        ,sotr."Подразделение" as "Подразделение МПП"
+    from (select distinct dks_project from project_pairs) pp -- убираем дубли, если одному ДКС соответствует несколько Альф
+        join voipclient."leasing_interaction" li 
+            on li."project_id" = pp.dks_project
+        left join voipclient."configuration_operator" op 
+            on op."id" = li."operator"
+        left join dwh."Сотрудники" sotr 
+            on sotr."Логин" = op."login"
+           and li."started" > sotr."DateFrom"
+           and li."started" < sotr."DateTo"
+    order by li."project_id", li."started"
+)
+
+-- 5. Финальная сборка результата
+select
+     pp.dks_project       as "Номер проекта исходящего ДКС"
+    ,pp.alfa_project      as "Номер проекта Альфа банка"
+    ,pp.dks_date::date    as "Дата заведения проекта исходящего ДКС"
+    ,pp.alfa_date::date   as "Дата заведения проекта Альфа банка"
+    ,mpp."Подразделение МПП"
+from project_pairs pp
+    left join dks_mpp mpp 
+        on mpp.project_id = pp.dks_project
+order by pp.dks_date desc;
