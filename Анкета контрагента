@@ -1,0 +1,31 @@
+-- Тэги: анкета КК, Карта Контрагента, клиентские данные
+
+--================================================================
+-- Достаю инфу из анкеты контрагента
+--================================================================
+
+-- !!! Выполнять скрипт в БД fo (там лежит prod САФО) !!!
+
+select distinct
+	q."CtaId"
+	,concat('https://fo.europlan.ru/questionary/', q."Guid") as "Ссылка на анкету"
+	,(q."Data"->>'CompletionOn')::date as "Дата заполнения анкеты"
+	,q."Data"->'Signer'->>'Name' as "ФИО ЕИО"	-- ФИО Единоличного Исполнительного Органа
+	,q."Data"->'Signer'->>'Position' as "Должность ЕИО"
+	,q."Data"->'LegalEntityCounteragent'->'Beneficiary'->>'IsBeneficiaryExists' as "Бенефициар существует?"   		-- true - существует, false - не существует
+	,q."Data"->'LegalEntityCounteragent'->'Beneficiary'->>'IsPersonBeneficiary' as "Бенефициар физ.лицо/физ.лица?"  -- true - ФЛ, false - ЮЛ
+	,q."Data"->'LegalEntityCounteragent'->'CommonInformation'->'ClientInformation'->>'Ogrn' as "ОГРН ЮЛ"
+	,q."Data"->'LegalEntityCounteragent'->'CommonInformation'->'ClientInformation'->>'Inn' as "ИНН ЮЛ"  
+	,q."Data"->'LegalEntityCounteragent'->'CommonInformation'->'ClientInformation'->>'ShortName' as "Название ЮЛ"   
+    ,jsonb_array_elements(q."Data"->'LegalEntityCounteragent'->'MembersAndOwners'->'Members')->'Person'->'RussianCitizen'->'NameInfo'->>'LastName' as "Фамилия"	 -- далее идут данные участников/владельцев ЮЛ
+    ,jsonb_array_elements(q."Data"->'LegalEntityCounteragent'->'MembersAndOwners'->'Members')->'Person'->'RussianCitizen'->'NameInfo'->>'FirstName' as "Имя"
+    ,jsonb_array_elements(q."Data"->'LegalEntityCounteragent'->'MembersAndOwners'->'Members')->'Person'->'RussianCitizen'->'NameInfo'->>'MiddleName' as "Отчество"
+    ,jsonb_array_elements(q."Data"->'LegalEntityCounteragent'->'MembersAndOwners'->'Members')->'Person'->'RussianCitizen'->>'Inn' as "ИНН участников ЮЛ"
+    ,jsonb_array_elements(q."Data"->'LegalEntityCounteragent'->'MembersAndOwners'->'Members')->'Person'->'RussianCitizen'->'ContactInformation'->>'Phone' as "Телефон"
+    ,jsonb_array_elements(q."Data"->'LegalEntityCounteragent'->'MembersAndOwners'->'Members')->'Person'->'RussianCitizen'->'ContactInformation'->>'Email' as "Email"
+from cta."Questionary" q
+group by
+	q."CtaId"
+	,q."Guid" 
+order by
+	q."CtaId" asc;
