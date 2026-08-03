@@ -1,0 +1,68 @@
+--================================================================
+-- Перезаведённые проекты: пара "исходящий ДКС" → "Поставщик/Альфа банк"
+-- по одному клиенту (CtaRepositoryId + BranchId), Альфа не позже 120 дней
+-- ПОСЛЕ проекта ДКС. + подразделение МПП, заведшего проект ДКС.
+--================================================================
+
+with
+
+-- проекты исходящего ДКС + подразделение оператора, заведшего проект
+dks_proj as (
+    select distinct on (li."project_id")
+         li."project_id"      as project_id
+        ,sotr."Подразделение" as "Подразделение МПП"
+    from voipclient."leasing_interaction" li
+        join voipclient."leasing_task" lt
+            on lt."id" = li."task"
+        join voipclient."leasing_campaign" lc
+            on lc."id" = lt."campaign"
+           and lc."type" = 1                              -- <<< исходящий канал ДКС
+        left join voipclient."configuration_operator" op
+            on op."id" = li."operator"
+        left join dwh."Сотрудники" sotr
+            on sotr."Логин" = op."login"
+           and li."started" > sotr."DateFrom"
+           and li."started" < sotr."DateTo"
+    where li."project_id" is not null
+    order by li."project_id", li."started"               -- первая итерация с проектом = заведение
+),
+
+-- сторона ДКС: атрибуты проекта из SAFO
+p_dks as (
+    select
+         sp."Номер проекта"          as dks_project
+        ,sp."CtaRepositoryId"
+        ,sp."BranchId"
+        ,sp."Дата создания проекта"  as dks_date
+        ,d."Подразделение МПП"
+    from dwh."SAFO_Project" sp
+        join dks_proj d
+            on d.project_id = sp."Номер проекта"
+),
+
+-- сторона Альфа-банка: проекты Поставщик + Альфа банк
+p_alfa as (
+    select
+         sp."Номер проекта"          as alfa_project
+        ,sp."CtaRepositoryId"
+        ,sp."BranchId"
+        ,sp."Дата создания проекта"  as alfa_date
+    from dwh."SAFO_Project" sp
+    where sp."Группа источника обращения"      = 'Поставщик'
+      and sp."Наименование источника обращения" = 'Альфа банк'
+)
+
+select
+     p_dks.dks_project            as "Номер проекта исходящего ДКС"
+    ,p_alfa.alfa_project          as "Номер проекта Альфа банка"
+    ,p_dks.dks_date::date         as "Дата заведения проекта исходящего ДКС"
+    ,p_alfa.alfa_date::date       as "Дата заведения проекта Альфа банка"
+    ,p_dks."Подразделение МПП"
+from p_dks
+    join p_alfa
+        on p_alfa."CtaRepositoryId" = p_dks."CtaRepositoryId"   -- один клиент
+       and p_alfa."BranchId"        = p_dks."BranchId"          -- один филиал
+       and p_alfa.alfa_date >= p_dks.dks_date                   -- Альфа НЕ раньше ДКС
+       and p_alfa.alfa_date <  p_dks.dks_date + interval '120 days'  -- в пределах 120 дней от ДКС
+order by p_dks.dks_date desc
+;
