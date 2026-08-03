@@ -1,0 +1,51 @@
+--================================================================
+-- Атрибутивные проекты Альфа-банка (источник обращения = 'Альфа банк'),
+-- где ЧИ делится между исходящим ДКС и поставщиками (оба > 0).
+-- Поля: номера и даты заведения обоих проектов + подразделение МПП.
+--================================================================
+
+with
+
+attr as (
+    -- атрибуция из функции: только делёж исходящий + поставщики
+    select
+         a."Номер проекта"
+        ,a."Исходный проект ДКС"
+    from ds."FT_Daily_Project_Marketing_Communication_Attribution"() a
+    where a."ЧИИсходящие"  > 0
+      and a."ЧИПоставщики" > 0
+),
+
+orig_div as (
+    -- подразделение оператора (МПП), заведшего ИСХОДНЫЙ проект ДКС
+    -- (первая по времени итерация, где проставился project_id)
+    select distinct on (li."project_id")
+         li."project_id"      as "Исходный проект"
+        ,sotr."Подразделение" as "Подразделение МПП"
+    from voipclient."leasing_interaction" li
+        left join voipclient."configuration_operator" op
+            on op."id" = li."operator"
+        left join dwh."Сотрудники" sotr
+            on sotr."Логин" = op."login"
+           and li."started" > sotr."DateFrom"
+           and li."started" < sotr."DateTo"
+    where li."project_id" is not null
+    order by li."project_id", li."started"
+)
+
+select
+     attr."Номер проекта"                as "Номер проекта Альфа Банк"
+    ,attr."Исходный проект ДКС"          as "Исходный проект"
+    ,sp."Дата создания проекта"::date    as "Дата заведения проекта Альфа банк"
+    ,sp_orig."Дата создания проекта"::date as "Дата заведения исходного проекта"
+    ,od."Подразделение МПП"
+from attr
+    join dwh."SAFO_Project" sp
+        on sp."Номер проекта" = attr."Номер проекта"           -- источник у атрибутивного проекта
+    left join dwh."SAFO_Project" sp_orig
+        on sp_orig."Номер проекта" = attr."Исходный проект ДКС" -- даты исходного проекта
+    left join orig_div od
+        on od."Исходный проект" = attr."Исходный проект ДКС"
+where sp."Наименование источника обращения" = 'Альфа банк'
+order by attr."Номер проекта"
+;
