@@ -1,0 +1,168 @@
+- Теги: КЛ, контактное лицо, лица, телефон, связанный контрагент, клиент
+
+--============================================================
+-- Сбор переченя контактных лиц и телефонов компаний
+--============================================================
+-- select * from "tt_CtaContactPersons_all_branch"
+drop table if exists "tt_CtaContactPersons_all_branch";
+create temp table "tt_CtaContactPersons_all_branch" as
+with a as (
+        select
+         c."PrincipalId" as "CtaRepositoryId" --"владелец" контактного лица, то есть само Юр лицо
+        ,cta."BranchId"
+        ,c."DependentId" as "PersonCtaRepositoryId" -- это и есть контактное лицо
+    from
+        cta."CounteragentLinks" c
+            join dwh."Cta_Counteragents" cta
+                    on c."PrincipalId" = cta."CtaRepositoryId" 
+    where
+        c."RemovedAt" is null
+            and cta."RemovedAt" is null
+            and c."Type" = 1
+            and c."BranchId" is null --Branchid is null and type = 1, то контактное лицо есть во всех филиалах Юр лица.
+union
+    select
+         c."PrincipalId" as "CtaRepositoryId"
+        ,c."BranchId"
+        ,c."DependentId" as "PersonCtaRepositoryId"
+    from
+        cta."CounteragentLinks" c
+            join dwh."Cta_Counteragents" cta
+                    on c."PrincipalId" = cta."CtaRepositoryId"
+    where
+        c."RemovedAt" is null
+            and cta."RemovedAt" is null
+            and c."Type" = 1
+            and c."BranchId" is not null -- Branchid is not null, то контактное лицо есть только в этом бренче
+)
+select 
+     a."CtaRepositoryId"
+    ,a."BranchId"
+    ,a."PersonCtaRepositoryId"
+    ,pl."Number"
+from 
+    a 
+    left join cta."PhoneLinks" as pl
+            on pl."CounteragentId" = a."PersonCtaRepositoryId"
+;
+
+
+--=================================================================
+-- Пример поиска контрагентов, связанных через общих контактных лиц
+--=================================================================
+-- select * from tt_persons
+drop table if exists tt_persons;
+create temp table tt_persons as
+with
+cte_links as (
+	select
+         c."PrincipalId" as "CtaRepositoryId" --"владелец" контактного лица, то есть само Юр лицо
+        ,c."DependentId" as "PersonCtaRepositoryId" -- это и есть контактное лицо
+    from
+        cta."CounteragentLinks" c
+            join dwh."Cta_Counteragents" cta
+                on c."PrincipalId" = cta."CtaRepositoryId" 
+                    and cta."RemovedAt" is null
+    where
+	     exists (select 1 from tt_project_mop p
+    				where c."PrincipalId" = p."CtaRepositoryId")
+        and c."RemovedAt" is null
+        and c."Type" = 1
+-- Теги: КЛ, контактное лицо, лица, телефон, связанный контрагент, клиент
+
+--============================================================
+-- Сбор переченя контактных лиц и телефонов компаний
+--============================================================
+-- select * from "tt_CtaContactPersons_all_branch"
+drop table if exists "tt_CtaContactPersons_all_branch";
+create temp table "tt_CtaContactPersons_all_branch" as
+with a as (
+        select
+         c."PrincipalId" as "CtaRepositoryId" --"владелец" контактного лица, то есть само Юр лицо
+        ,cta."BranchId"
+        ,c."DependentId" as "PersonCtaRepositoryId" -- это и есть контактное лицо
+    from
+        cta."CounteragentLinks" c
+            join dwh."Cta_Counteragents" cta
+                    on c."PrincipalId" = cta."CtaRepositoryId" 
+    where
+        c."RemovedAt" is null
+            and cta."RemovedAt" is null
+            and c."Type" = 1
+            and c."BranchId" is null --Branchid is null and type = 1, то контактное лицо есть во всех филиалах Юр лица.
+union
+    select
+         c."PrincipalId" as "CtaRepositoryId"
+        ,c."BranchId"
+        ,c."DependentId" as "PersonCtaRepositoryId"
+    from
+        cta."CounteragentLinks" c
+            join dwh."Cta_Counteragents" cta
+                    on c."PrincipalId" = cta."CtaRepositoryId"
+    where
+        c."RemovedAt" is null
+            and cta."RemovedAt" is null
+            and c."Type" = 1
+            and c."BranchId" is not null -- Branchid is not null, то контактное лицо есть только в этом бренче
+)
+select 
+     a."CtaRepositoryId"
+    ,a."BranchId"
+    ,a."PersonCtaRepositoryId"
+    ,pl."Number"
+from 
+    a 
+    left join cta."PhoneLinks" as pl
+            on pl."CounteragentId" = a."PersonCtaRepositoryId"
+;
+
+
+--=================================================================
+-- Пример поиска контрагентов, связанных через общих контактных лиц
+--=================================================================
+-- select * from tt_persons
+drop table if exists tt_persons;
+create temp table tt_persons as
+with
+cte_links as (
+	select
+         c."PrincipalId" as "CtaRepositoryId" --"владелец" контактного лица, то есть само Юр лицо
+        ,c."DependentId" as "PersonCtaRepositoryId" -- это и есть контактное лицо
+    from
+        cta."CounteragentLinks" c
+            join dwh."Cta_Counteragents" cta
+                on c."PrincipalId" = cta."CtaRepositoryId" 
+                    and cta."RemovedAt" is null
+    where
+	     exists (select 1 from tt_project_mop p
+    				where c."PrincipalId" = p."CtaRepositoryId")
+        and c."RemovedAt" is null
+        and c."Type" = 1
+        and c."BranchId" is null --Branchid is null and type = 1, то контактное лицо есть во всех филиалах Юр лица.
+union
+    select
+         c."PrincipalId" as "CtaRepositoryId"
+        ,c."DependentId" as "PersonCtaRepositoryId"
+    from
+        cta."CounteragentLinks" c
+        join dwh."Cta_Counteragents" cta
+                on c."PrincipalId" = cta."CtaRepositoryId" 
+                    and cta."RemovedAt" is null
+    where
+    	exists (select 1 from tt_project_mop p
+    				where c."PrincipalId" = p."CtaRepositoryId")
+        and c."RemovedAt" is null
+        and c."Type" = 1
+        and c."BranchId" is not null -- Branchid is not null, то контактное лицо есть только в этом бренче
+)
+select
+     p."CtaRepositoryId"
+    ,c."PrincipalId" as "Связанные CtaRepositoryId"
+from
+	cte_links p
+	join cta."CounteragentLinks" c
+		on p."PersonCtaRepositoryId" = c."DependentId"
+			and p."CtaRepositoryId" != c."PrincipalId" -- находим другие ЮЛ у того же КЛ
+;
+
+
