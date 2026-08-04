@@ -1,0 +1,139 @@
+--================================================================
+-- MS SQL: перезаведённые проекты ДКС → Поставщик/Альфа банк
+-- Поиск пар и атрибуты обоих проектов — в PG через OPENQUERY,
+-- группа оператора — из Report.dcc_ba_tasks_info (MS SQL).
+-- + дата архива проекта ДКС.
+--================================================================
+
+drop table if exists #pairs;
+
+select *
+into #pairs
+from openquery([db-warehouse-production], '
+with
+
+dks_base as (
+    select distinct li."project_id"
+    from voipclient."leasing_interaction" li
+        join voipclient."leasing_task" lt on lt."id" = li."task"
+        join voipclient."leasing_campaign" lc on lc."id" = lt."campaign"
+    where lc."type" = 1
+      and li."project_id" is not null
+),
+
+p_alfa as (
+    select
+         sp."Номер проекта"          as alfa_project
+        ,sp."CtaRepositoryId"
+        ,sp."BranchId"
+        ,sp."Дата создания проекта"  as alfa_date
+    from dwh."SAFO_Project" sp
+    where sp."Группа источника обращения"       = ''Поставщик''
+      and sp."Наименование источника обращения" = ''Альфа банк''
+),
+
+project_pairs as (
+    select
+         sp."Номер проекта"         as dks_project
+        ,p_alfa.alfa_project
+        ,sp."Дата создания проекта" as dks_date
+        ,p_alfa.alfa_date
+    from dwh."SAFO_Project" sp
+        join dks_base d on d.project_id = sp."Номер проекта"
+        join p_alfa
+            on p_alfa."CtaRepositoryId" = sp."CtaRepositoryId"
+           and p_alfa."BranchId"        = sp."BranchId"
+           and p_alfa.alfa_date >= sp."Дата создания проекта"
+           and p_alfa.alfa_date <  sp."Дата создания проекта" + interval ''120 days''
+),
+
+target_projects as (
+    select dks_project  as project from project_pairs
+    union
+    select alfa_project as project from project_pairs
+),
+
+-- последняя запись лога (причина архива + комментарий + последняя дата работы)
+archive_info as (
+    select distinct on (psl."ProjectId")
+         psl."ProjectId"
+        ,rr."Name"        as archive_reason
+        ,psl."Description" as archive_comment
+        ,psl."CreatedAt"   as last_work_date
+    from safo."Projects_StatusLog" psl
+        join target_projects tp on tp.project = psl."ProjectId"
+        left join safo."Projects_RejectionReason" rr on rr."id" = psl."RejectionReasonId"
+    order by psl."ProjectId", psl."CreatedAt" desc
+),
+
+-- дата архива = дата последней записи лога, где проставлена причина архива (RejectionReasonId)
+archive_date as (
+    select distinct on (psl."ProjectId")
+         psl."ProjectId"
+        ,psl."CreatedAt" as archive_date
+    from safo."Projects_StatusLog" psl
+        join target_projects tp on tp.project = psl."ProjectId"
+    where psl."RejectionReasonId" is not null
+    order by psl."ProjectId", psl."CreatedAt" desc
+)
+
+select
+     pp.dks_project
+    ,pp.alfa_project
+    ,pp.dks_date::date   as dks_date
+    ,pp.alfa_date::date  as alfa_date
+
+    ,sp_dks."Статус"        as dks_status
+    ,sp_dks."Этап"          as dks_stage
+    ,ai_dks.archive_reason  as dks_archive_reason
+    ,ai_dks.archive_comment as dks_archive_comment
+    ,ai_dks.last_work_date::date as dks_last_work_date
+    ,ad_dks.archive_date::date   as dks_archive_date
+    ,sp_dks."Подразделение" as dks_division
+
+    ,sp_alfa."Статус"        as alfa_status
+    ,sp_alfa."Этап"          as alfa_stage
+    ,ai_alfa.archive_reason  as alfa_archive_reason
+    ,ai_alfa.archive_comment as alfa_archive_comment
+    ,ai_alfa.last_work_date::date as alfa_last_work_date
+    ,sp_alfa."Подразделение" as alfa_division
+
+from project_pairs pp
+    left join dwh."SAFO_Project" sp_dks  on sp_dks."Номер проекта"  = pp.dks_project
+    left join archive_info      ai_dks   on ai_dks."ProjectId"      = pp.dks_project
+    left join archive_date      ad_dks   on ad_dks."ProjectId"      = pp.dks_project
+    left join dwh."SAFO_Project" sp_alfa on sp_alfa."Номер проекта" = pp.alfa_project
+    left join archive_info      ai_alfa  on ai_alfa."ProjectId"     = pp.alfa_project
+')
+;
+
+--================================================================
+-- Добираем группу оператора из MS SQL-таблицы по проекту ДКС
+--================================================================
+select
+     p.dks_project           as [Номер проекта исходящего ДКС]
+    ,p.alfa_project          as [Номер проекта Альфа банка]
+    ,p.dks_date              as [Дата заведения проекта исходящего ДКС]
+    ,p.alfa_date             as [Дата заведения проекта Альфа банка]
+
+    ,p.dks_status            as [Текущий статус ДКС]
+    ,p.dks_stage             as [Текущий этап ДКС]
+    ,p.dks_archive_reason    as [Причина архива ДКС]
+    ,p.dks_archive_comment   as [Комментарий при архивации ДКС]
+    ,p.dks_last_work_date    as [Последняя дата работы ДКС]
+    ,p.dks_archive_date      as [Дата архива ДКС]
+    ,p.dks_division          as [Подразделение ДКС]
+
+    ,p.alfa_status           as [Текущий статус Альфа]
+    ,p.alfa_stage            as [Текущий этап Альфа]
+    ,p.alfa_archive_reason   as [Причина архива Альфа]
+    ,p.alfa_archive_comment  as [Комментарий при архивации Альфа]
+    ,p.alfa_last_work_date   as [Последняя дата работы Альфа]
+    ,p.alfa_division         as [Подразделение Альфа]
+
+    ,dcc.[Группа оператора]  as [Группа оператора ДКС]
+from #pairs p
+    left join [Report].[dcc_ba_tasks_info] dcc
+        on dcc.[Номер проекта] = p.dks_project
+order by p.dks_date desc
+;
