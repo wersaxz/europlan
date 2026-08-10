@@ -13,7 +13,11 @@ from
     join voipclient.leasing_campaign lc on lc.id = lt.campaign
 where
         lc.type = 1                                        -- исходящий канал
-    and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес (is not null неявно)
+    and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
     and li.comment is not null
     and btrim(li.comment) <> ''
+    -- исключаем системные комментарии:
+    and li.comment not ilike '%закрыт автодозвоном по НБТ%'   -- НБТ-автозакрытие
+    and li.comment not ilike 'Следующий звонок%'              -- планирование следующего звонка
+    and li.comment not ilike '%Задача деактивирована%'        -- любая деактивация задачи
 ;
