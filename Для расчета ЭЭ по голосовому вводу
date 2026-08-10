@@ -36,4 +36,7 @@ where
     and li.comment not ilike '%Причина проекта без встречи%'                 -- отметка причины (без встречи)
     and li.comment not ilike '%Заведение проекта согласовал%'                -- отметка согласования заведения (в т.ч. "согласовала")
     and not (li.comment ilike '%Контактное лицо%' and li.comment ilike '%встреч%')  -- шаблон с контактным лицом и встречей
+    and li.comment not ilike '%http%'                                        -- ссылки (http и https)
+    and li.comment not ilike '%Контактное лицо:%'                            -- шаблон с контактным лицом
+    and li.comment not ilike '%Клиент:%'                                     -- шаблон с клиентом
 ;
