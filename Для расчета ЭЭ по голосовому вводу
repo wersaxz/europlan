@@ -5,12 +5,28 @@ select
     ,li.started                         as "started"
     ,li.ended                           as "ended"
     ,li.project_id                      as "project_id"
+    ,li.operator                        as "operator_id"                     -- id оператора (1 = бот-автодозвон)
+    ,op.login                           as "Логин"
+    ,concat(op.last_name, ' ', op.second_name, ' ', op.first_name) as "ФИО"
+    ,sotr."Должность"                   as "Должность"
+    ,sotr."Подразделение"               as "Подразделение"
+    ,case when sotr."Должность" ilike '%старший%'  then 'СМПП'
+          when sotr."Должность" ilike '%младший%'  then 'ММПП'
+          when sotr."Должность" ilike '%ведущий%'  then 'ВМПП'
+          when sotr."Должность" ilike '%главный%'  then 'ГМПП'
+          when sotr."Должность" in ('Эксперт','Менеджер','Специалист','Внештатный менеджер') then 'МПП'
+          else 'Прочие'
+     end                                as "Грейд"
     ,li.comment                         as "comment"
     ,round(length(li.comment) / 5.0, 2) as "Words"       -- символы / 5 = "слова" для WPM
 from
     voipclient.leasing_interaction li
-    join voipclient.leasing_task     lt on lt.id = li.task
-    join voipclient.leasing_campaign lc on lc.id = lt.campaign
+    join voipclient.leasing_task            lt   on lt.id = li.task
+    join voipclient.leasing_campaign        lc   on lc.id = lt.campaign
+    left join voipclient.configuration_operator op on op.id = li.operator
+    left join dwh."Сотрудники"              sotr on sotr."Логин" = op.login
+                                                and li.started > sotr."DateFrom"
+                                                and li.started < sotr."DateTo"
 where
         lc.type = 1                                        -- исходящий канал
     and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
@@ -41,5 +57,5 @@ where
     and li.comment not ilike '%Клиент:%'                                     -- шаблон с клиентом
     and li.comment not ilike '%согласовала%'                                 -- отметка согласования (форма "согласовала")
     and li.comment not ilike '%Клиент :%'                                    -- шаблон с клиентом (пробел перед двоеточием)
-    and li.comment not ilike '%СОГЛАСОВАНО%'                                 -- отметка согласования (любой регистр = %согласовано%)
+    and li.comment not ilike '%СОГЛАСОВАНО%'                                 -- отметка согласования (любой регистр)
 ;
