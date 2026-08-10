@@ -16,6 +16,7 @@ where
     and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
     and li.comment is not null
     and btrim(li.comment) <> ''
+    and length(li.comment) / 5.0 >= 10                     -- Words >= 10 (короткие не проговариваются)
     -- исключаем системные комментарии:
     and li.comment not ilike '%закрыт автодозвоном по НБТ%'   -- НБТ-автозакрытие
     and li.comment not ilike 'Следующий звонок%'              -- планирование следующего звонка
