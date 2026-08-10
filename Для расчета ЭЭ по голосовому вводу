@@ -32,25 +32,23 @@ select
     ,b.project_id                      as "project_id"
     ,b.comment                         as "comment"
     ,round(length(btrim(regexp_replace(b.comment, '\s+', ' ', 'g'))) / 5.0, 2) as "Words"   -- пробелы схлопнуты
-    ,replace(
-        case
-            when b.comment ilike '%Выручка%'
-             and b.comment ilike '%Комментарий к предмету согласования:%'
-            then round(
-                    length(
-                        btrim(
-                            regexp_replace(
-                                coalesce(
-                                    substring(b.comment from '(?is)Комментарий к предмету согласования:(.*?)(?:Контактное лицо|Цель приобретения|Выручка компании за год)'),
-                                    substring(b.comment from '(?is)Комментарий к предмету согласования:(.*)$')
-                                )
-                            , '\s+', ' ', 'g')
-                        )
-                    ) / 5.0
-                 , 2)
-            -- не подошло под условие согласования → берём значение Words
-            else round(length(btrim(regexp_replace(b.comment, '\s+', ' ', 'g'))) / 5.0, 2)
-        end::text
-    , '.', ',')                        as "Wordsv2"      -- точка → запятая; иначе = Words
+    ,case
+        when b.comment ilike '%Выручка%'
+         and b.comment ilike '%Комментарий к предмету согласования:%'
+        then round(
+                length(
+                    btrim(
+                        regexp_replace(
+                            coalesce(
+                                substring(b.comment from '(?is)Комментарий к предмету согласования:(.*?)(?:Контактное лицо|Цель приобретения|Выручка компании за год)'),
+                                substring(b.comment from '(?is)Комментарий к предмету согласования:(.*)$')
+                            )
+                        , '\s+', ' ', 'g')
+                    )
+                ) / 5.0
+             , 2)
+        -- не подошло под условие согласования → берём значение Words
+        else round(length(btrim(regexp_replace(b.comment, '\s+', ' ', 'g'))) / 5.0, 2)
+     end                               as "Wordsv2"      -- числовой, с точкой; иначе = Words
 from base b
 ;
