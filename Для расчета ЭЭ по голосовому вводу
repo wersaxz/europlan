@@ -51,4 +51,5 @@ select
             end
         else null
      end                               as "Wordsv2"      -- "ручная" часть согласования; 'ОШИБКА' если нет "Контактное лицо"
+from base b
 ;
