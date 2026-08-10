@@ -21,4 +21,5 @@ where
     and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
     and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- шаблон планирования следующего звонка
     and li.comment not ilike '%Задача деактивирована%'                       -- любая деактивация задачи
+    and li.comment not ilike '%Правила работы по проекту ДКС%'               -- памятка по правилам работы
 ;
