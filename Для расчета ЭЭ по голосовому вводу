@@ -39,4 +39,7 @@ where
     and li.comment not ilike '%http%'                                        -- ссылки (http и https)
     and li.comment not ilike '%Контактное лицо:%'                            -- шаблон с контактным лицом
     and li.comment not ilike '%Клиент:%'                                     -- шаблон с клиентом
+    and li.comment not ilike '%согласовала%'                                 -- отметка согласования (форма "согласовала")
+    and li.comment not ilike '%Клиент :%'                                    -- шаблон с клиентом (пробел перед двоеточием)
+    and li.comment not ilike '%СОГЛАСОВАНО%'                                 -- отметка согласования (любой регистр = %согласовано%)
 ;
