@@ -1,25 +1,54 @@
+with base as (
+    select
+         li.id
+        ,li.task
+        ,li.status
+        ,li.started
+        ,li.ended
+        ,li.project_id
+        ,li.comment
+    from
+        voipclient.leasing_interaction li
+        join voipclient.leasing_task     lt on lt.id = li.task
+        join voipclient.leasing_campaign lc on lc.id = lt.campaign
+    where
+            lc.type = 1                                        -- исходящий канал
+        and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
+        and li.comment is not null
+        and btrim(li.comment) <> ''
+        and length(li.comment) / 5.0 >= 10                     -- Words >= 10
+        -- исключаем системные комментарии:
+        and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
+        and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- планирование звонка
+        and li.comment not ilike '%Задача деактивирована%'                       -- деактивация задачи
+        and li.comment not ilike '%Правила работы по проекту ДКС%'               -- памятка
+)
 select
-     li.id                              as "id"          -- номер интеракции
-    ,li.task                            as "task"        -- номер задачи
-    ,li.status                          as "status"
-    ,li.started                         as "started"
-    ,li.ended                           as "ended"
-    ,li.project_id                      as "project_id"
-    ,li.comment                         as "comment"
-    ,round(length(li.comment) / 5.0, 2) as "Words"       -- символы / 5 = "слова" для WPM
-from
-    voipclient.leasing_interaction li
-    join voipclient.leasing_task     lt on lt.id = li.task
-    join voipclient.leasing_campaign lc on lc.id = lt.campaign
-where
-        lc.type = 1                                        -- исходящий канал
-    and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
-    and li.comment is not null
-    and btrim(li.comment) <> ''
-    and length(li.comment) / 5.0 >= 10                     -- Words >= 10 (короткие не проговариваются)
-    -- исключаем системные комментарии:
-    and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
-    and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- шаблон планирования следующего звонка
-    and li.comment not ilike '%Задача деактивирована%'                       -- любая деактивация задачи
-    and li.comment not ilike '%Правила работы по проекту ДКС%'               -- памятка по правилам работы
+     b.id                              as "id"          -- номер интеракции
+    ,b.task                            as "task"        -- номер задачи
+    ,b.status                          as "status"
+    ,b.started                         as "started"
+    ,b.ended                           as "ended"
+    ,b.project_id                      as "project_id"
+    ,b.comment                         as "comment"
+    ,round(length(b.comment) / 5.0, 2) as "Words"       -- по всему комментарию (без изменений)
+    ,case
+        when b.comment ilike '%Выручка%'
+         and b.comment ilike '%Комментарий к предмету согласования:%'
+        then
+            case
+                -- есть якорь И "Контактное лицо" после него → считаем "ручную" часть
+                when substring(b.comment from '(?is)Комментарий к предмету согласования:(.*?)Контактное лицо') is not null
+                then round(
+                        length(
+                            btrim(
+                                substring(b.comment from '(?is)Комментарий к предмету согласования:(.*?)Контактное лицо')
+                            )
+                        ) / 5.0
+                     , 2)::text
+                -- якорь есть, "Контактное лицо" после него нет → помечаем
+                else 'ОШИБКА'
+            end
+        else null
+     end                               as "Wordsv2"      -- "ручная" часть согласования; 'ОШИБКА' если нет "Контактное лицо"
 ;
