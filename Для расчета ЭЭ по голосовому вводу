@@ -1,0 +1,19 @@
+select
+     li.id                              as "id"          -- номер интеракции
+    ,li.task                            as "task"        -- номер задачи
+    ,li.status                          as "status"
+    ,li.started                         as "started"
+    ,li.ended                           as "ended"
+    ,li.project_id                      as "project_id"
+    ,li.comment                         as "comment"
+    ,round(length(li.comment) / 5.0, 2) as "Words"       -- символы / 5 = "слова" для WPM
+from
+    voipclient.leasing_interaction li
+    join voipclient.leasing_task     lt on lt.id = li.task
+    join voipclient.leasing_campaign lc on lc.id = lt.campaign
+where
+        lc.type = 1                                        -- исходящий канал
+    and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес (is not null неявно)
+    and li.comment is not null
+    and btrim(li.comment) <> ''
+;
