@@ -16,7 +16,7 @@ with base as (
         and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
         and li.comment is not null
         and btrim(li.comment) <> ''
-        and length(li.comment) / 5.0 >= 10                     -- Words >= 10
+        and length(li.comment) / 5.0 >= 10                     -- Words >= 10 (по сырому тексту)
         -- исключаем системные комментарии:
         and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
         and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- планирование звонка
@@ -31,25 +31,25 @@ select
     ,b.ended                           as "ended"
     ,b.project_id                      as "project_id"
     ,b.comment                         as "comment"
-    ,round(length(b.comment) / 5.0, 2) as "Words"       -- по всему комментарию (без изменений)
+    ,round(length(btrim(regexp_replace(b.comment, '\s+', ' ', 'g'))) / 5.0, 2) as "Words"   -- пробелы схлопнуты
     ,case
         when b.comment ilike '%Выручка%'
          and b.comment ilike '%Комментарий к предмету согласования:%'
         then
             case
-                -- есть якорь И один из ограничителей после него → считаем "ручную" часть
                 when substring(b.comment from '(?is)Комментарий к предмету согласования:(.*?)(?:Контактное лицо|Цель приобретения|Выручка компании за год)') is not null
                 then round(
                         length(
                             btrim(
-                                substring(b.comment from '(?is)Комментарий к предмету согласования:(.*?)(?:Контактное лицо|Цель приобретения|Выручка компании за год)')
+                                regexp_replace(
+                                    substring(b.comment from '(?is)Комментарий к предмету согласования:(.*?)(?:Контактное лицо|Цель приобретения|Выручка компании за год)')
+                                , '\s+', ' ', 'g')
                             )
                         ) / 5.0
                      , 2)::text
-                -- якорь есть, ни один ограничитель после него не найден → помечаем
                 else 'ОШИБКА'
             end
         else null
-     end                               as "Wordsv2"      -- "ручная" часть согласования; 'ОШИБКА' если нет ни одного ограничителя
+     end                               as "Wordsv2"      -- "ручная" часть, пробелы схлопнуты; 'ОШИБКА' если нет ограничителя
 from base b
 ;
