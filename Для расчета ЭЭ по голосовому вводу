@@ -22,6 +22,9 @@ with base as (
         and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- планирование звонка
         and li.comment not ilike '%Задача деактивирована%'                       -- деактивация задачи
         and li.comment not ilike '%Правила работы по проекту ДКС%'               -- памятка
+        -- согласование без предмета согласования:
+        and not (btrim(li.comment) ilike 'Согласование получено%' and li.comment not ilike '%Комментарий к предмету согласования%')
+        and not (btrim(li.comment) ilike 'Получено согласование%' and li.comment not ilike '%Комментарий к предмету согласования%')
 )
 select
      b.id                              as "id"          -- номер интеракции
