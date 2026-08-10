@@ -25,6 +25,7 @@ with base as (
         -- согласование без предмета согласования:
         and not (btrim(li.comment) ilike 'Согласование получено%' and li.comment not ilike '%Комментарий к предмету согласования%')
         and not (btrim(li.comment) ilike 'Получено согласование%' and li.comment not ilike '%Комментарий к предмету согласования%')
+        and not (li.comment ilike '%Предмет согласования%' and li.comment not ilike '%Комментарий к предмету согласования%')
 )
 select
      b.id                              as "id"          -- номер интеракции
