@@ -1,51 +1,62 @@
-select
-     li.id                              as "id"          -- номер интеракции
-    ,li.task                            as "task"        -- номер задачи
-    ,li.status                          as "status"
-    ,li.started                         as "started"
-    ,li.ended                           as "ended"
-    ,li.project_id                      as "project_id"
-    ,li.comment                         as "comment"     -- сырой текст (для контроля)
-    ,round(length(
-        btrim(regexp_replace(regexp_replace(li.comment, '[_\-=*~.]{2,}', ' ', 'g'), '\s+', ' ', 'g'))
-     ) / 5.0, 2)                        as "Words"       -- разделители убраны, пробелы схлопнуты
-from
-    voipclient.leasing_interaction li
-    join voipclient.leasing_task     lt on lt.id = li.task
-    join voipclient.leasing_campaign lc on lc.id = lt.campaign
-where
-        lc.type = 1                                        -- исходящий канал
-    and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
-    and li.comment is not null
-    and btrim(li.comment) <> ''
-    and length(
-        btrim(regexp_replace(regexp_replace(li.comment, '[_\-=*~.]{2,}', ' ', 'g'), '\s+', ' ', 'g'))
-     ) / 5.0 >= 15                                         -- Words >= 15 (по очищенной длине)
-    -- исключаем системные комментарии:
-    and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
-    and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- шаблон планирования следующего звонка
-    and li.comment not ilike '%Задача деактивирована%'                       -- любая деактивация задачи
-    and li.comment not ilike '%Правила работы по проекту ДКС%'               -- памятка по правилам работы
-    and li.comment not ilike '%Комментарий к предмету согласования%'         -- шаблон согласования
-    and not (li.comment ilike '%предметы лизинга%'
-         and li.comment ilike '%выручка%'
-         and li.comment ilike '%причина%')                                   -- шаблон с предметами лизинга/выручкой/причиной
-    and li.comment not ilike '%получено согласование от%'                    -- шаблон согласования (получено ... от)
-    and li.comment not ilike '%согласование получено от%'                    -- шаблон согласования (получено ... от, др. порядок)
-    and li.comment not ilike '%Согласовано:%'                                -- отметка согласования
-    and li.comment not ilike '%Согласовано :%'                               -- отметка согласования (пробел перед двоеточием)
-    and li.comment not ilike '%Проект согласовал%'                           -- отметка согласования (в т.ч. "согласовала")
-    and li.comment not ilike '%Заведение проекта согласовала%'               -- отметка согласования заведения
-    and li.comment not ilike '%Предмет согласования%'                        -- шаблон согласования (предмет)
-    and li.comment not ilike '%Причина проекта без встречи%'                 -- отметка причины (без встречи)
-    and li.comment not ilike '%Заведение проекта согласовал%'                -- отметка согласования заведения (в т.ч. "согласовала")
-    and not (li.comment ilike '%Контактное лицо%' and li.comment ilike '%встреч%')  -- шаблон с контактным лицом и встречей
-    and li.comment not ilike '%http%'                                        -- ссылки (http и https)
-    and li.comment not ilike '%Контактное лицо:%'                            -- шаблон с контактным лицом
-    and li.comment not ilike '%Клиент:%'                                     -- шаблон с клиентом
-    and li.comment not ilike '%согласовала%'                                 -- отметка согласования (форма "согласовала")
-    and li.comment not ilike '%Клиент :%'                                    -- шаблон с клиентом (пробел перед двоеточием)
-    and li.comment not ilike '%СОГЛАСОВАНО%'                                 -- отметка согласования (любой регистр = %согласовано%)
-    and not (li.comment ilike '%Система налогообложения%'
-         and li.comment ilike '%Основной вид деятельности%')                 -- анкетный шаблон (налогообложение + вид деятельности)
+with filtered as (
+    select
+         li.id
+        ,li.task
+        ,li.status
+        ,li.started
+        ,li.ended
+        ,li.project_id
+        ,li.comment
+        ,btrim(regexp_replace(regexp_replace(li.comment, '[_\-=*~.]{2,}', ' ', 'g'), '\s+', ' ', 'g')) as comment_norm
+    from
+        voipclient.leasing_interaction li
+        join voipclient.leasing_task     lt on lt.id = li.task
+        join voipclient.leasing_campaign lc on lc.id = lt.campaign
+    where
+            lc.type = 1                                        -- исходящий канал
+        and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
+        and li.comment is not null
+        and btrim(li.comment) <> ''
+        and length(
+            btrim(regexp_replace(regexp_replace(li.comment, '[_\-=*~.]{2,}', ' ', 'g'), '\s+', ' ', 'g'))
+         ) / 5.0 >= 15                                         -- Words >= 15 (по очищенной длине)
+        -- исключаем системные комментарии:
+        and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
+        and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- планирование звонка
+        and li.comment not ilike '%Задача деактивирована%'                       -- деактивация задачи
+        and li.comment not ilike '%Правила работы по проекту ДКС%'               -- памятка
+        and li.comment not ilike '%Комментарий к предмету согласования%'         -- согласование
+        and not (li.comment ilike '%предметы лизинга%'
+             and li.comment ilike '%выручка%'
+             and li.comment ilike '%причина%')                                   -- предметы лизинга/выручка/причина
+        and li.comment not ilike '%получено согласование от%'                    -- согласование (получено ... от)
+        and li.comment not ilike '%согласование получено от%'                    -- согласование (получено ... от, др. порядок)
+        and li.comment not ilike '%Согласовано:%'                                -- отметка согласования
+        and li.comment not ilike '%Согласовано :%'                               -- отметка согласования (пробел перед :)
+        and li.comment not ilike '%Проект согласовал%'                           -- отметка согласования (в т.ч. "согласовала")
+        and li.comment not ilike '%Заведение проекта согласовала%'               -- согласование заведения
+        and li.comment not ilike '%Предмет согласования%'                        -- согласование (предмет)
+        and li.comment not ilike '%Причина проекта без встречи%'                 -- причина (без встречи)
+        and li.comment not ilike '%Заведение проекта согласовал%'                -- согласование заведения (в т.ч. "согласовала")
+        and not (li.comment ilike '%Контактное лицо%' and li.comment ilike '%встреч%')  -- контактное лицо + встреча
+        and li.comment not ilike '%http%'                                        -- ссылки (http и https)
+        and li.comment not ilike '%Контактное лицо:%'                            -- контактное лицо
+        and li.comment not ilike '%Клиент:%'                                     -- клиент
+        and li.comment not ilike '%согласовала%'                                 -- согласование (форма "согласовала")
+        and li.comment not ilike '%Клиент :%'                                    -- клиент (пробел перед :)
+        and li.comment not ilike '%СОГЛАСОВАНО%'                                 -- согласование (любой регистр)
+        and not (li.comment ilike '%Система налогообложения%'
+             and li.comment ilike '%Основной вид деятельности%')                 -- анкетный шаблон
+)
+select distinct on (f.comment_norm)
+     f.id                              as "id"          -- номер интеракции
+    ,f.task                            as "task"        -- номер задачи
+    ,f.status                          as "status"
+    ,f.started                         as "started"
+    ,f.ended                           as "ended"
+    ,f.project_id                      as "project_id"
+    ,f.comment                         as "comment"
+    ,round(length(f.comment_norm) / 5.0, 2) as "Words"
+from filtered f
+order by f.comment_norm, f.ended desc nulls last, f.id desc   -- из дублей берём самый свежий
 ;
