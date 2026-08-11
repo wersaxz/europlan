@@ -7,7 +7,13 @@ with filtered as (
         ,li.ended
         ,li.project_id
         ,li.comment
-        ,btrim(regexp_replace(regexp_replace(li.comment, '[_\-=*~.]{2,}', ' ', 'g'), '\s+', ' ', 'g')) as comment_norm
+        ,btrim(
+            regexp_replace(
+                regexp_replace(
+                    regexp_replace(li.comment, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', ' ', 'g'),  -- почты → пробел
+                '[_\-=*~.]{2,}', ' ', 'g'),                                                                   -- разделители → пробел
+            '\s+', ' ', 'g')                                                                                 -- пробелы схлопнуть
+         ) as comment_norm
     from
         voipclient.leasing_interaction li
         join voipclient.leasing_task     lt on lt.id = li.task
@@ -17,9 +23,6 @@ with filtered as (
         and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
         and li.comment is not null
         and btrim(li.comment) <> ''
-        and length(
-            btrim(regexp_replace(regexp_replace(li.comment, '[_\-=*~.]{2,}', ' ', 'g'), '\s+', ' ', 'g'))
-         ) / 5.0 >= 15                                         -- Words >= 15 (по очищенной длине)
         -- исключаем системные комментарии:
         and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
         and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- планирование звонка
@@ -49,14 +52,15 @@ with filtered as (
              and li.comment ilike '%Основной вид деятельности%')                 -- анкетный шаблон
 )
 select distinct on (f.comment_norm)
-     f.id                              as "id"          -- номер интеракции
-    ,f.task                            as "task"        -- номер задачи
-    ,f.status                          as "status"
-    ,f.started                         as "started"
-    ,f.ended                           as "ended"
-    ,f.project_id                      as "project_id"
-    ,f.comment                         as "comment"
-    ,round(length(f.comment_norm) / 5.0, 2) as "Words"
+     f.id                                    as "id"          -- номер интеракции
+    ,f.task                                  as "task"        -- номер задачи
+    ,f.status                                as "status"
+    ,f.started                               as "started"
+    ,f.ended                                 as "ended"
+    ,f.project_id                            as "project_id"
+    ,f.comment                               as "comment"     -- сырой текст (для контроля)
+    ,round(length(f.comment_norm) / 5.0, 2)  as "Words"       -- почты/разделители убраны, пробелы схлопнуты
 from filtered f
-order by f.comment_norm, f.ended desc nulls last, f.id desc   -- из дублей берём самый свежий
+where length(f.comment_norm) / 5.0 >= 15                      -- Words >= 15 (по очищенной длине, уже без почт)
+order by f.comment_norm, f.ended desc nulls last, f.id desc   -- из дублей — самый свежий
 ;
