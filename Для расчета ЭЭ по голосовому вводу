@@ -1,4 +1,10 @@
-with filtered as (
+with params as (
+    select
+         50::numeric   as wpm_type       -- скорость печати, слов/мин
+        ,3.5::numeric  as voice_speedup  -- во сколько раз голос быстрее печати
+        ,0.25::numeric as review_share   -- доля перепроверки от времени надиктовки (25%)
+)
+,filtered as (
     select
          li.id
         ,li.task
@@ -51,16 +57,38 @@ with filtered as (
         and not (li.comment ilike '%Система налогообложения%'
              and li.comment ilike '%Основной вид деятельности%')                 -- анкетный шаблон
 )
-select distinct on (f.comment_norm)
-     f.id                                    as "id"          -- номер интеракции
-    ,f.task                                  as "task"        -- номер задачи
-    ,f.status                                as "status"
-    ,f.started                               as "started"
-    ,f.ended                                 as "ended"
-    ,f.project_id                            as "project_id"
-    ,f.comment                               as "comment"     -- сырой текст (для контроля)
-    ,round(length(f.comment_norm) / 5.0, 2)  as "Words"       -- почты/разделители убраны, пробелы схлопнуты
-from filtered f
-where length(f.comment_norm) / 5.0 >= 15                      -- Words >= 15 (по очищенной длине, уже без почт)
-order by f.comment_norm, f.ended desc nulls last, f.id desc   -- из дублей — самый свежий
+,dedup as (
+    select distinct on (f.comment_norm)
+         f.id
+        ,f.task
+        ,f.status
+        ,f.started
+        ,f.ended
+        ,f.project_id
+        ,f.comment
+        ,round(length(f.comment_norm) / 5.0, 2) as words
+    from filtered f
+    where length(f.comment_norm) / 5.0 >= 15                       -- Words >= 15 (по очищенной длине)
+    order by f.comment_norm, f.ended desc nulls last, f.id desc    -- из дублей — самый свежий
+)
+select
+     d.id                                                    as "id"
+    ,d.task                                                  as "task"
+    ,d.status                                                as "status"
+    ,d.started                                               as "started"
+    ,d.ended                                                 as "ended"
+    ,d.project_id                                            as "project_id"
+    ,d.comment                                               as "comment"
+    ,d.words                                                 as "Words"
+    ,round(d.words / p.wpm_type * 60, 1)                     as "sec_type"        -- время печати, сек
+    ,round(d.words / p.wpm_type * 60 / p.voice_speedup, 1)   as "sec_voice_raw"   -- надиктовка, сек
+    ,round(d.words / p.wpm_type * 60 / p.voice_speedup * p.review_share, 1) as "sec_review"  -- перепроверка, сек
+    ,round(d.words / p.wpm_type * 60 / p.voice_speedup * (1 + p.review_share), 1) as "sec_voice_total"  -- голос всего, сек
+    ,round(
+        d.words / p.wpm_type * 60
+      - d.words / p.wpm_type * 60 / p.voice_speedup * (1 + p.review_share)
+     , 1)                                                    as "sec_saved"       -- экономия (А), сек
+from dedup d
+cross join params p
+order by "sec_saved" desc
 ;
