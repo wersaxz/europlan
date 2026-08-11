@@ -5,8 +5,10 @@ select
     ,li.started                         as "started"
     ,li.ended                           as "ended"
     ,li.project_id                      as "project_id"
-    ,li.comment                         as "comment"
-    ,round(length(li.comment) / 5.0, 2) as "Words"       -- символы / 5 = "слова" для WPM
+    ,li.comment                         as "comment"     -- сырой текст (для контроля)
+    ,round(length(
+        btrim(regexp_replace(regexp_replace(li.comment, '[_\-=*~.]{2,}', ' ', 'g'), '\s+', ' ', 'g'))
+     ) / 5.0, 2)                        as "Words"       -- разделители убраны, пробелы схлопнуты
 from
     voipclient.leasing_interaction li
     join voipclient.leasing_task     lt on lt.id = li.task
@@ -16,7 +18,9 @@ where
     and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
     and li.comment is not null
     and btrim(li.comment) <> ''
-    and length(li.comment) / 5.0 >= 15                     -- Words >= 15 (короткие не проговариваются)
+    and length(
+        btrim(regexp_replace(regexp_replace(li.comment, '[_\-=*~.]{2,}', ' ', 'g'), '\s+', ' ', 'g'))
+     ) / 5.0 >= 15                                         -- Words >= 15 (по очищенной длине)
     -- исключаем системные комментарии:
     and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
     and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- шаблон планирования следующего звонка
