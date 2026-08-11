@@ -1,12 +1,94 @@
-Наумец	Константин	Сергеевич
-9308888778
-esazonova71@yandex.ru 
-
-ГАЗ фургон 5м, 2,3 м высота 
-Рассматривать готов как новый, со скидкой и субсидией так и с пробегом вариант.
-На новый по стоимости не ориентировала, на пробег до 1,5 млн руб., по возрасту сказал до 5 ти лет, в хорошем состоянии, где авто найдем не важно радиус поиска задал 1000 км, со слов клиента у них есть водители который смогут забрать и пригнать.
-По расчетам на газель просил сделать с  авансом 15-20% ,  по сроку так, чтобы платеж был до 100 тыс. руб.
-
-Легковое авто с пробегом, отечественные марки или иномарки до 800 тыс. руб., китайские марки не готовы смотреть. ТС желательно из наших ПА, в хорошем состоянии,  по расположению не принципиально, могут посмотреть варианты и из под такси, т.к. уже логан покупали так и остались довольны. Легковое ТС нужно для партнера и передвижения по между объектами.
-Срок 3 года, аванс 10%/15%/20% чтобы платежи были до 40 тыс. руб.
-Клиент хочет встретится с менеджером, чтобы все обсудить, но с датой и временем определиться не смог, сказал что с менеджером договорятся. 
+with params as (
+    select
+         50::numeric   as wpm_type       -- скорость печати, слов/мин
+        ,3.5::numeric  as voice_speedup  -- во сколько раз голос быстрее печати
+        ,0.25::numeric as review_share   -- доля перепроверки от времени надиктовки (25%)
+)
+,filtered as (
+    select
+         li.id
+        ,li.task
+        ,li.status
+        ,li.started
+        ,li.ended
+        ,li.project_id
+        ,li.comment
+        ,btrim(
+            regexp_replace(
+                regexp_replace(
+                    regexp_replace(li.comment, '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', ' ', 'g'),  -- почты → пробел
+                '[_\-=*~.]{2,}', ' ', 'g'),                                                                   -- разделители → пробел
+            '\s+', ' ', 'g')                                                                                 -- пробелы схлопнуть
+         ) as comment_norm
+    from
+        voipclient.leasing_interaction li
+        join voipclient.leasing_task     lt on lt.id = li.task
+        join voipclient.leasing_campaign lc on lc.id = lt.campaign
+    where
+            lc.type = 1                                        -- исходящий канал
+        and li.ended >= now() - interval '12 months'           -- ended за последние 12 мес
+        and li.comment is not null
+        and btrim(li.comment) <> ''
+        -- исключаем системные комментарии:
+        and li.comment not ilike '%закрыт автодозвоном по НБТ%'                  -- НБТ-автозакрытие
+        and not (li.comment ilike '%Следующий звонок%' and li.comment ilike '%Контакт%')  -- планирование звонка
+        and li.comment not ilike '%Задача деактивирована%'                       -- деактивация задачи
+        and li.comment not ilike '%Правила работы по проекту ДКС%'               -- памятка
+        and li.comment not ilike '%Комментарий к предмету согласования%'         -- согласование
+        and not (li.comment ilike '%предметы лизинга%'
+             and li.comment ilike '%выручка%'
+             and li.comment ilike '%причина%')                                   -- предметы лизинга/выручка/причина
+        and li.comment not ilike '%получено согласование от%'                    -- согласование (получено ... от)
+        and li.comment not ilike '%согласование получено от%'                    -- согласование (получено ... от, др. порядок)
+        and li.comment not ilike '%Согласовано:%'                                -- отметка согласования
+        and li.comment not ilike '%Согласовано :%'                               -- отметка согласования (пробел перед :)
+        and li.comment not ilike '%Проект согласовал%'                           -- отметка согласования (в т.ч. "согласовала")
+        and li.comment not ilike '%Заведение проекта согласовала%'               -- согласование заведения
+        and li.comment not ilike '%Предмет согласования%'                        -- согласование (предмет)
+        and li.comment not ilike '%Причина проекта без встречи%'                 -- причина (без встречи)
+        and li.comment not ilike '%Заведение проекта согласовал%'                -- согласование заведения (в т.ч. "согласовала")
+        and not (li.comment ilike '%Контактное лицо%' and li.comment ilike '%встреч%')  -- контактное лицо + встреча
+        and li.comment not ilike '%http%'                                        -- ссылки (http и https)
+        and li.comment not ilike '%Контактное лицо:%'                            -- контактное лицо
+        and li.comment not ilike '%Клиент:%'                                     -- клиент
+        and li.comment not ilike '%согласовала%'                                 -- согласование (форма "согласовала")
+        and li.comment not ilike '%Клиент :%'                                    -- клиент (пробел перед :)
+        and li.comment not ilike '%СОГЛАСОВАНО%'                                 -- согласование (любой регистр)
+        and not (li.comment ilike '%Система налогообложения%'
+             and li.comment ilike '%Основной вид деятельности%')                 -- анкетный шаблон
+)
+,dedup as (
+    select distinct on (f.comment_norm)
+         f.id
+        ,f.task
+        ,f.status
+        ,f.started
+        ,f.ended
+        ,f.project_id
+        ,f.comment
+        ,round(length(f.comment_norm) / 5.0, 2) as words
+    from filtered f
+    where length(f.comment_norm) / 5.0 >= 15                       -- Words >= 15 (по очищенной длине)
+    order by f.comment_norm, f.ended desc nulls last, f.id desc    -- из дублей — самый свежий
+)
+select
+     d.id                                                    as "id"
+    ,d.task                                                  as "task"
+    ,d.status                                                as "status"
+    ,d.started                                               as "started"
+    ,d.ended                                                 as "ended"
+    ,d.project_id                                            as "project_id"
+    ,d.comment                                               as "comment"
+    ,d.words                                                 as "Words"
+    ,round(d.words / p.wpm_type * 60, 1)                     as "sec_type"        -- время печати, сек
+    ,round(d.words / p.wpm_type * 60 / p.voice_speedup, 1)   as "sec_voice_raw"   -- надиктовка, сек
+    ,round(d.words / p.wpm_type * 60 / p.voice_speedup * p.review_share, 1) as "sec_review"  -- перепроверка, сек
+    ,round(d.words / p.wpm_type * 60 / p.voice_speedup * (1 + p.review_share), 1) as "sec_voice_total"  -- голос всего, сек
+    ,round(
+        d.words / p.wpm_type * 60
+      - d.words / p.wpm_type * 60 / p.voice_speedup * (1 + p.review_share)
+     , 1)                                                    as "sec_saved"       -- экономия (А), сек
+from dedup d
+cross join params p
+order by "sec_saved" desc
+;
