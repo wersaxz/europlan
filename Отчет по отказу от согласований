@@ -1,0 +1,101 @@
+--собираем покупки
+DROP TABLE IF EXISTS tmp_purchases;
+CREATE TEMP TABLE tmp_purchases AS
+SELECT
+    sp."ProjectId",
+    sp."Prj_CreatedAt",
+    COALESCE(cte1."ЕП", 0)                 AS "ЕП",
+    COALESCE(cte1."не ЕП", 0)              AS "не ЕП",
+    cte1."Дата первой покупки в ЕП"        AS "Дата первой покупки в ЕП",
+    cte1."Дата первой покупки не в ЕП"     AS "Дата первой покупки не в ЕП",
+    sp."TaskId",
+    sp."BranchId",
+    sp."ЦД МОП",
+    sp."Дивизион по МОП"
+FROM ds."DCC_Tasks_BA_Info" sp
+JOIN (
+    SELECT
+        sp2."TaskId",
+        COUNT(*) FILTER (WHERE ap."Источник" = 'ЕП')      AS "ЕП",
+        COUNT(*) FILTER (WHERE ap."Источник" <> 'ЕП')     AS "не ЕП",
+        MIN(ap."ДатаПокупки") FILTER (WHERE ap."Источник" = 'ЕП')
+            AS "Дата первой покупки в ЕП",
+        MIN(ap."ДатаПокупки") FILTER (WHERE ap."Источник" <> 'ЕП')
+            AS "Дата первой покупки не в ЕП"
+    FROM ds."DCC_Tasks_BA_Info" sp2
+    JOIN (SELECT task, closed_date FROM dcc."FT_Project_Coordinations"()) f 
+        ON sp2."TaskId" = f.task
+    JOIN dwh."AllPurchases" ap
+        ON sp2."BranchId" = ap."BranchId"
+       AND ap."IsPurchase" = true
+       AND ap."TargetSegment" = TRUE
+       AND ap."Источник" IN ('ЕП','ЕФРС')
+       AND ap."ДатаПокупки" BETWEEN f.closed_date::date 
+                               AND (f.closed_date::date + INTERVAL '60 day')
+    GROUP BY sp2."TaskId"
+) cte1
+    ON sp."TaskId" = cte1."TaskId";
+
+
+DROP TABLE IF EXISTS tmp_final;
+CREATE TEMP TABLE tmp_final AS
+SELECT 
+    ta.*
+    ,1                                                                                                         AS "один"
+    ,ta.closed_date::date                                                                                      AS "Дата завершения задачи"
+    ,CASE WHEN ta.was_transfer = 1 THEN 1 ELSE 0 END                                                           AS "Была передача"
+    ,CASE WHEN pr."ЕП" > 0 AND ta.is_prj = 1 THEN 1 ELSE 0 END                                                 AS "Факт покупки в ЕП в проектах"
+    ,CASE WHEN pr."не ЕП" > 0 AND ta.is_prj = 1 THEN 1 ELSE 0 END                                              AS "Факт покупки не в ЕП в проектах"
+    ,CASE WHEN (COALESCE(pr."ЕП",0) > 0 OR COALESCE(pr."не ЕП",0) > 0) AND ta.is_prj = 1 THEN 1 ELSE 0 END     AS "Факт покупки в лизинг в проектах"
+    ,CASE WHEN (COALESCE(pr."не ЕП",0) > 0 OR COALESCE(pr."ЕП",0) > 0) AND ta.is_prj = 1 THEN 1 ELSE 0 END     AS "Качество в проектах"
+    ,CASE WHEN (COALESCE(pr."не ЕП",0) > 0 OR COALESCE(pr."ЕП",0) > 0) AND ta.is_prj <> 1 THEN 1 ELSE 0 END    AS "Покупка в отказах"
+    ,CASE WHEN (COALESCE(pr."не ЕП",0) > 0 OR COALESCE(pr."ЕП",0) > 0) THEN 1 ELSE 0 END                        AS "Качество в задачах"
+    ,ti."Была передача по всем"
+    ,lt.payload_type
+    ,CASE WHEN COALESCE(pr."ЕП",0) > 0 THEN 1 ELSE 0 END                                                       AS "Факт покупки в ЕП в завершенных задачах"
+    ,CASE WHEN COALESCE(pr."не ЕП",0) > 0 THEN 1 ELSE 0 END                                                    AS "Факт покупки не в ЕП в завершенных задачах"
+    ,CASE WHEN (COALESCE(pr."ЕП", 0) > 0 OR COALESCE(pr."не ЕП", 0) > 0) THEN 1 ELSE 0 END                      AS "Факт покупки в лизинг в завершенных задачах"
+    ,app."Лизингодатель"
+    ,CASE WHEN ta.is_prj = 1 THEN 0 ELSE 1 END                                                                 AS "отказ"
+    ,pr."Дата первой покупки не в ЕП"
+    ,CASE WHEN emp."Подразделение" = 'Сектор работы с клиентами' THEN 1 ELSE 0 END                              AS "МРК"
+    ,CASE WHEN emp."Подразделение" = 'Сектор работы с клиентами и партнерами' THEN 1 ELSE 0 END                 AS "МРКП"
+    ,CASE WHEN emp."Подразделение" IN ('Сектор работы с клиентами', 'Сектор работы с клиентами и партнерами') THEN 1 ELSE 0 END AS "МРК или МРКП"
+    ,ti."ЦД МОП"
+    ,ti."Дивизион по МОП"
+    ,ROW_NUMBER() OVER (PARTITION BY ta.task ORDER BY ta.coordination_date)                                    AS rn
+FROM (
+    SELECT *
+    FROM dcc."FT_Project_Coordinations"()
+) ta
+JOIN ds."DCC_Tasks_BA_Info" ti
+    ON ta.task = ti."TaskId"
+JOIN voipclient.leasing_task lt
+    ON ti."TaskId" = lt.id
+LEFT JOIN tmp_purchases pr
+    ON pr."TaskId" = ti."TaskId"
+LEFT JOIN (
+    SELECT
+        ap."Лизингодатель",
+        tp."BranchId",
+        ap."ДатаПокупки"
+    FROM tmp_purchases tp
+    JOIN dwh."AllPurchases" ap
+        ON tp."BranchId" = ap."BranchId"
+       AND tp."Дата первой покупки не в ЕП" = ap."ДатаПокупки"
+       AND ap."Источник" = 'ЕФРС'
+       AND ap."IsPurchase" = true
+) AS app
+    ON app."BranchId" = ti."BranchId"
+   AND app."ДатаПокупки" BETWEEN ti."Prj_CreatedAt" AND (ti."Prj_CreatedAt" + INTERVAL '60 day')
+LEFT JOIN dwh."Сотрудники" emp
+    ON ta.mop_login = emp."Логин"
+   AND ta.closed_date::date >= emp."DateFrom" 
+   AND ta.closed_date::date <= COALESCE(emp."DateTo", DATE '2099-01-01')
+WHERE lt.payload_type <> 'partners'; -- убираем проекты от поставщиков
+
+
+SELECT
+    fi.*
+FROM tmp_final fi
+WHERE rn = 1;
