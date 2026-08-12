@@ -1,117 +1,60 @@
 -- ============================================================================
--- ОТКАЗЫ ПО СОГЛАСОВАНИЮ — исходящий ДКС
---   + факт передачи в ЕП за 60 дней (по клиенту / CtaRepositoryId)
---   + факт покупки в лизинг за 60 дней (по клиенту / CtaRepositoryId)
---   + разрез по ЦД МОП (фильтр %Кемерово% в детальном запросе)
---
--- Согласованные параметры:
---   • Отказ                    = is_prj <> 1 (первое согласование, rn = 1)
---   • Якорь окна 60 дн         = closed_date задачи
---   • Уровень передачи/покупки = клиент (CtaRepositoryId)
---   • Канал                    = исходящий ДКС (leasing_campaign.type = 1)
+-- ОТКАЗЫ ПО СОГЛАСОВАНИЮ — исходящий ДКС, ЦД МОП = Кемерово
+--   Период: дата завершения задачи за последние 2 года
+--   Отказ  = is_prj <> 1 (первое согласование по задаче, rn = 1)
+--   Окно   = 60 дней от closed_date; покупки — по клиенту (CtaRepositoryId)
 -- ============================================================================
 
--- 0. Тяжёлую функцию согласований материализуем один раз
+-- 0. Функция согласований — материализуем один раз, сразу режем период 2 года
 drop table if exists tmp_coord;
 create temp table tmp_coord as
 select
      ta.task
     ,ta.closed_date
-    ,ta.coordination_date
     ,ta.is_prj
-    ,ta.mop_login
     ,row_number() over (partition by ta.task order by ta.coordination_date) as rn
-from dcc."FT_Project_Coordinations"() ta;
+from dcc."FT_Project_Coordinations"() ta
+where ta.closed_date::date >= (current_date - interval '2 years')::date;
 
--- 1. База: первое согласование = отказ, только исходящий ДКС.
---    Тянем ProjectId, CtaRepositoryId, ЦД МОП, дату завершения и границы окна.
+-- 1. Отказы, только исходящий ДКС, только ЦД МОП Кемерово
 drop table if exists tmp_refusals;
 create temp table tmp_refusals as
 select
      c.task
-    ,ti."ProjectId"
-    ,coalesce(sp."CtaRepositoryId", lt.cta_repository_id)      as "CtaRepositoryId"
-    ,ti."ЦД МОП"
-    ,ti."Дивизион по МОП"
-    ,c.closed_date::date                                       as "Дата завершения задачи"
-    ,c.closed_date::date                                       as d_from
-    ,(c.closed_date::date + interval '60 day')::date           as d_to
+    ,c.closed_date::date                                    as "Дата завершения задачи"
+    ,ti."ProjectId"                                         as "Номер проекта"
+    ,coalesce(sp."CtaRepositoryId", lt.cta_repository_id)   as "CtaRepositoryId"
+    ,c.closed_date::date                                    as d_from
+    ,(c.closed_date::date + interval '60 day')::date        as d_to
 from tmp_coord c
     join voipclient.leasing_task     lt on c.task = lt.id
     join voipclient.leasing_campaign lc on lt.campaign = lc.id
     join ds."DCC_Tasks_BA_Info"      ti on c.task = ti."TaskId"
     left join dwh."SAFO_Project"     sp on sp."Номер проекта" = ti."ProjectId"
-where c.rn = 1                       -- первое согласование по задаче
-  and c.is_prj is distinct from 1    -- ОТКАЗ (is_prj <> 1; NULL тоже отказ)
-  and lc."type" = 1                  -- исходящий ДКС
-  and lt.payload_type <> 'partners'  -- страховка от поставщиков
-;
+where c.rn = 1
+  and c.is_prj is distinct from 1        -- ОТКАЗ (is_prj <> 1; NULL тоже отказ)
+  and lc."type" = 1                      -- исходящий ДКС
+  and lt.payload_type <> 'partners'
+  and ti."ЦД МОП" ilike '%Кемерово%';    -- <<< маска ЦД МОП
 
--- 2. Проставляем факты передачи и покупки в окне 60 дней (по клиенту).
---    EXISTS — только факт (1/0), без размножения строк.
-drop table if exists tmp_out;
-create temp table tmp_out as
+-- 2. ИТОГ
 select
-     r.*
-    ,case when exists (
-        select 1 from dwh."IC_ДоговорЛизинга" dl
-        where dl."CtaRepositoryId" = r."CtaRepositoryId"
-          and dl."ДатаПередачи" is not null
-          and dl."ДатаПередачи"::date between r.d_from and r.d_to
-     ) then 1 else 0 end as "Передача в ЕП 60 дн."
+     r.task                     as "Номер задачи"
+    ,r."Дата завершения задачи"
+    ,r."Номер проекта"
     ,case when exists (
         select 1 from dwh."AllPurchases" ap
         where ap."CtaRepositoryId" = r."CtaRepositoryId"
-          and ap."IsPurchase"    = true
-          and ap."TargetSegment" = true
-          and ap."Источник" in ('ЕП','ЕФРС')
-          and ap."ДатаПокупки"::date between r.d_from and r.d_to
-     ) then 1 else 0 end as "Покупка в лизинг 60 дн."
-    ,case when exists (
-        select 1 from dwh."AllPurchases" ap
-        where ap."CtaRepositoryId" = r."CtaRepositoryId"
-          and ap."IsPurchase"    = true and ap."TargetSegment" = true
+          and ap."IsPurchase" = true and ap."TargetSegment" = true
           and ap."Источник" = 'ЕП'
           and ap."ДатаПокупки"::date between r.d_from and r.d_to
-     ) then 1 else 0 end as "Покупка в ЕП 60 дн."
+     ) then 1 else 0 end        as "Факт покупки в ЕП 60 дней"
     ,case when exists (
         select 1 from dwh."AllPurchases" ap
         where ap."CtaRepositoryId" = r."CtaRepositoryId"
-          and ap."IsPurchase"    = true and ap."TargetSegment" = true
-          and ap."Источник" = 'ЕФРС'
+          and ap."IsPurchase" = true and ap."TargetSegment" = true
+          and ap."Источник" in ('ЕП','ЕФРС')
           and ap."ДатаПокупки"::date between r.d_from and r.d_to
-     ) then 1 else 0 end as "Покупка НЕ в ЕП 60 дн."
-from tmp_refusals r;
-
--- ============================================================================
--- ИТОГ 1 — детальный список отказов по ЦД МОП (по умолчанию: Кемерово)
--- ============================================================================
-select
-     "ЦД МОП"
-    ,"Дивизион по МОП"
-    ,task              as "Номер задачи"
-    ,"ProjectId"       as "Номер проекта"
-    ,"CtaRepositoryId"
-    ,"Дата завершения задачи"
-    ,"Передача в ЕП 60 дн."
-    ,"Покупка в лизинг 60 дн."
-    ,"Покупка в ЕП 60 дн."
-    ,"Покупка НЕ в ЕП 60 дн."
-from tmp_out
-where "ЦД МОП" ilike '%Кемерово%'   -- <<< поменяй маску / закомментируй для всех ЦД
-order by "Дата завершения задачи";
-
--- ============================================================================
--- ИТОГ 2 — сводка по ЦД МОП (все ЦД, чтобы Кемерово было видно в контексте)
--- ============================================================================
-select
-     "ЦД МОП"
-    ,count(*)                                            as "Отказов по согласованию"
-    ,sum("Передача в ЕП 60 дн.")                         as "С передачей в ЕП"
-    ,round(avg("Передача в ЕП 60 дн."::numeric), 3)      as "Доля с передачей в ЕП"
-    ,sum("Покупка в лизинг 60 дн.")                      as "С покупкой в лизинг"
-    ,round(avg("Покупка в лизинг 60 дн."::numeric), 3)   as "Доля с покупкой в лизинг"
-    ,sum("Покупка НЕ в ЕП 60 дн.")                       as "Ушли в лизинг не в ЕП"
-from tmp_out
-group by "ЦД МОП"
-order by "Отказов по согласованию" desc;
+     ) then 1 else 0 end        as "Факт покупки в лизинг 60 дней"
+from tmp_refusals r
+order by r."Дата завершения задачи";
