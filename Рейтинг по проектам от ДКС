@@ -1,1 +1,614 @@
+-- Детализированная выгрузка по проектам из всех каналов продаж
+-- реализована в августе 2024
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+drop table if exists "tt_all_projects_data"; -- собираем все проекты всех каналов с 2023, присваиваем им этап, статус и причину архива
+create temp table "tt_all_projects_data" as
+with a as (
+select 
+	 sp."Номер проекта"
+	,sp."Дата создания проекта"
+	,sp."Группа источника обращения"
+	,sp."Этап"
+	,sp."ЭтапID"
+	,sp."Статус"
+	,sp."СтатусID"
+	,sp."CtaRepositoryId"
+	,sp."BranchId"
+	--,first_value (psl."RejectionReasonId") over (partition by psl."ProjectId" order by psl."CreatedAt" desc) "RejectionReasonId"
+	,row_number () over (partition by psl."ProjectId" order by psl."CreatedAt" desc) rn
+	,psl."CreatedAt" "Последняя дата работы над проектом"
+	,psl."RejectionReasonId"
+	,rr."Name"
+	,psl."Description"
+from 
+		 dwh."SAFO_Project" sp
+	----
+	left join safo."Projects_StatusLog" psl
+		on sp."Номер проекта"  = psl."ProjectId" 
+		and sp."Дата создания проекта" > '2025-01-01' 
+	----
+	left join safo."Projects_RejectionReason" rr
+	  on rr."id" = psl."RejectionReasonId"
+)
+select * from a
+where rn = 1
+;
+
+
+drop table if exists "tt_projects_postponed"; -- собираем по всем проектам факт подготовки ПЛ
+create temp table "tt_projects_postponed" as
+with a as (
+select 
+	 distinct sp."Номер проекта"
+	,sp."Дата создания проекта"
+	,psl."StatusId"
+	,ps."StageId"
+	,min(psl."CreatedAt") as "Дата подготовки первого ПЛ"
+	,count(sp."Номер проекта") "Кол-во направления в Отложенные"
+from 
+		 "tt_all_projects_data" sp
+	----
+	left join safo."Projects_StatusLog" psl
+		on sp."Номер проекта"  = psl."ProjectId" 
+		and sp."Дата создания проекта" > '2025-01-01' 
+	---------
+	left join safo."Projects_Status" ps --select * from safo."Projects_Status"
+		   on ps."id" = psl."StatusId"
+where psl."StatusId"=4
+group by 
+	 sp."Номер проекта"
+	,sp."Дата создания проекта"
+	,psl."StatusId"
+	,ps."StageId"
+-- 10 этап = отложенные
+)
+select 
+	  distinct a."Номер проекта"
+	 ,"Кол-во направления в Отложенные"
+	 ,"Дата подготовки первого ПЛ"
+from a
+;
+-----------------------------------------------------------------------
+drop table if exists "tt_cwc"; --- Время звонка по проекту
+create temp table "tt_cwc" as
+with a as(
+select 
+	 tblk.*
+	,cwc.event_datetime_utc  "Время звонка"
+	,row_number() over(partition by tblk."Дата создания проекта" order by cwc.event_datetime_utc) rw
+from
+		 "tt_all_projects_data" tblk
+	left join dwh."ContactsWithCounteragents" cwc --- select * from  dwh."ContactsWithCounteragents" cwc 
+		 on tblk."CtaRepositoryId" = cwc."CtaRepositoryId"
+		and tblk."BranchId" = cwc."BranchId"
+		and cwc.event_datetime_utc  > tblk."Дата создания проекта"
+		and cwc.event_datetime_utc  < tblk."Дата создания проекта"+ interval '5 days'
+		and cwc."event_type" in (4, 5, 11, 12, 24, 25, 29, 30)
+	)
+select 
+	*
+from 
+	a
+where 
+	rw = 1 and "Время звонка" is not null
+;
+
+
+--------------------------------------------------------------------
+
+-----------------------------------------------------------------
+
+---------------------------------------------------------------------
+--select * from "tt_all_projects_data";
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+drop table if exists "tt_all_projects_data_previous_status"; -- собираем все проекты всех каналов с 2023, присваиваем им этап, статус и причину архива
+create temp table "tt_all_projects_data_previous_status" as
+with a as (
+select 
+	 tapd."Номер проекта"
+	,psl."StatusId"
+	,ps."Name" "Предыдущий статус проекта"
+	,row_number () over (partition by psl."ProjectId" order by psl."CreatedAt" desc) rn
+	,psl."CreatedAt" "Предыдущая дата работы над проектом"
+from "tt_all_projects_data" tapd
+	----
+	join safo."Projects_StatusLog" psl
+		on tapd."Номер проекта"  = psl."ProjectId" 
+		and tapd."Дата создания проекта" > '2025-01-01' 
+	join safo."Projects_Status" ps
+		on ps."id" = psl."StatusId"
+		 )
+select * from a
+where rn = 2
+;
+
+--select * from "tt_all_projects_data_previous_status";
+
+
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+drop table if exists "dks_projects"; -- все проекты дкс за нужный период
+create temp table "dks_projects" as
+with a as(
+select 
+         tapd."Номер проекта"
+        ,case 
+                when lc."type" = 1 then 'Исходящие'
+                else 'Входящие'
+         end "ДКС"
+        ,t."payload_type"
+        ,row_number() over(partition by li.project_id order by li.started) rn
+from 
+     	"tt_all_projects_data" tapd	
+    ----
+ 	join voipclient."leasing_interaction" li 
+ 		on li."project_id" =  tapd."Номер проекта" 
+ 		and  li."started" between '2025-01-01' and current_date 
+    ----
+ 	join voipclient."leasing_task" t
+        on li."task"=t."id"
+ 	----
+ 	join voipclient."leasing_campaign" lc 
+ 		on lc."id" = t."campaign"
+)
+select 
+         a."Номер проекта"
+        ,a."ДКС"
+        ,a."payload_type"
+        ,case 
+        	when "payload_type" = 'partners' and "ДКС" = 'Входящие' then 'Поставщики'
+        	when "payload_type" != 'partners' and "ДКС" = 'Входящие' then 'Входящие'
+        	else 'Исходящие'
+        end "ДКС_final"
+from 
+        a
+where 
+        rn = 1
+;
+
+
+--select * from "dks_projects";
+
+
+drop table if exists "tt_project_channels";
+create temp table "tt_project_channels"  as
+with a as (
+select 
+	tapd."Номер проекта"
+	,coalesce(dp."ДКС_final", tapd."Группа источника обращения") "Канал"
+from "tt_all_projects_data" tapd
+	---------
+	left join "dks_projects" dp
+           on dp."Номер проекта" =  tapd."Номер проекта"
+ )
+  select 
+   a."Номер проекта"
+  ,case 
+  	when "Канал" = 'Входящие' then 'Входящие'
+  	when "Канал" = 'Исходящие' then 'Исходящие'
+  	when "Канал" like '%Поставщик%' then 'Поставщики'
+  	else 'МОП'
+  end "Канал продаж"
+  from a
+ ;
+
+
+--select * from "tt_project_channels";
+
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+
+drop table if exists "tt_leasing_transfer"; -- собираем передачи по проекту и ЧИ с проекта
+create temp table "tt_leasing_transfer" as
+select 
+	 tapd."Номер проекта"
+	,min (dl."ДатаПередачи") :: date "Первая дата передачи" 
+	,sum(dl."ЧИ") "ЧИ проекта"
+	,count(dl."ProjectId") "Кол-во переданных ДФЛ в проекте"
+from 
+			  "tt_all_projects_data" tapd
+	---------
+	left join dwh."IC_ДоговорЛизинга" dl
+		 on tapd."Номер проекта" = dl."ProjectId"
+		and dl."ДатаПередачи" between tapd."Дата создания проекта" and tapd."Дата создания проекта"+ interval'60 days'
+group by 
+	 tapd."Номер проекта";
+
+
+
+--select * from "tt_leasing_transfer";
+
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+drop table if exists "tt_purchases"; -- собираем покупки ТС по проекту
+create temp table "tt_purchases" as
+select 
+	 tapd."Номер проекта"
+	 ,count(case when ap."Источник" = 'ЕП' then ap."Key" end) "Кол-во ТС в ЕП"
+	 ,count(case when ap."Источник" = 'ЕФРС' then ap."Key" end) "Кол-во ТС НЕ в ЕП"
+	 ,min(case when ap."Источник" = 'ЕП' then ap."ДатаПокупки" end) "Дата первой покупки в ЕП"
+	 ,min(case when ap."Источник" = 'ЕФРС' then ap."ДатаПокупки" end) "Дата первой покупки НЕ в ЕП"
+from "tt_all_projects_data" tapd
+	left join dwh."AllPurchases" ap 
+		 on tapd."CtaRepositoryId" = ap."CtaRepositoryId"
+		and ap."ДатаПокупки" between tapd."Дата создания проекта" and tapd."Дата создания проекта" + interval'60 days'
+		and ap."IsPurchase" is true 
+		and ap."Источник" in ('ЕП', 'ЕФРС')
+group by 
+	tapd."Номер проекта"
+;
+
+
+--select * from "tt_purchases";
+
+------------------------------------------------------------------------
+------------------------------------------------------------------------
+drop table if exists "tt_mop_for_projects_pre"; -- выводим МОП по проекту
+create temp table "tt_mop_for_projects_pre" as 
+with a as (
+select
+	  tapd."Номер проекта"
+	 ,tapd."Дата создания проекта" 
+	 ,tapd."Последняя дата работы над проектом"
+	 ,tcl."UserId"
+	 ,row_number () over (partition by tcl."ProjectId" order by tcl."DateFrom" desc) rn
+	 ,c."Сотрудник"
+	 ,c."Должность"
+	 ,c."SubdivisionId_SAFO_actual"
+	 ,c."Подразделение"
+	 ,c."Логин"
+	 --,sosh."Name" "Подразделение"
+from "tt_all_projects_data" tapd
+	---- 
+	join dwh."SAFO_Projects_TeamChangeLog" tcl
+	 	on tapd."Номер проекта" = tcl."ProjectId"
+	 	and tcl."RoleId" = 6
+	join dwh."Сотрудники" c 
+	 	on tcl."UserId" = c."UserID_SAFO"
+	 	and c."ActualRow" = 1
+)
+select 
+	  a."Номер проекта"
+	 ,a."Последняя дата работы над проектом"
+	 ,a."UserId"
+	 ,a."Сотрудник"
+	 ,a."Должность"
+	 ,a."SubdivisionId_SAFO_actual"
+	 ,a."Подразделение"
+	 ,a."Логин"
+--	 ,sosh."profitcenter_name" "Центр дохода"
+--	 ,sosh."revenuecenter_name" "Центр прибыли"
+--	 ,sosh."division_name" "Дивизион"
+from a
+--join ds."FT_SAFO_Org_Structure_History" (null, a."Последняя дата работы над проектом" :: date ) sosh 
+--	 	on sosh."subdivisionid" = a."SubdivisionId_SAFO_actual"
+where rn = 1
+;
+
+--analyze "tt_mop_for_projects_pre";
+
+
+drop table if exists "tt_mop_for_projects"; -- выводим МОП по проекту
+create temp table "tt_mop_for_projects" as 
+select
+	  a."Номер проекта"
+	 ,a."UserId"
+	 ,a."Сотрудник"
+	 ,a."Должность"
+	 ,a."SubdivisionId_SAFO_actual"
+	 ,a."Подразделение"
+	 ,sosh."department_name" "Наименование отдела"
+	 ,sosh."profitcenter_name" "Центр дохода"
+	 ,sosh."revenuecenter_name" "Центр прибыли"
+	 ,sosh."division_name" "Дивизион"
+	 ,a."Логин"
+from "tt_mop_for_projects_pre" a
+	  ----
+	  join ds."FT_SAFO_Org_Structure_History" (null, current_date) sosh
+-- a."Последняя дата работы над проектом" :: date ) sosh 
+	 	on sosh."subdivisionid" = a."SubdivisionId_SAFO_actual"
+;
+
+
+--select * from "tt_mop_for_projects";
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+drop table if exists tt_rep; -- собираем клиентов по ГК
+create temp table tt_rep as
+select 
+  coalesce(cc."GroupByOwnerId", -cc."CtaRepositoryId") gbo_id
+ ,cc."CtaRepositoryId"
+ ,cc."BranchId"
+from dwh."Cta_Counteragents" cc;
+
+
+
+drop table if exists tt_new_gbo_or_old_gbo; --ищем даты первых передач для всех ГК
+create temp table tt_new_gbo_or_old_gbo as
+select
+     tr.gbo_id
+    ,min(dl."ДатаПередачи") :: date first_transfer_by_gbo
+from 
+          tt_rep tr 
+    ----
+    left join dwh."IC_ДоговорЛизинга" dl
+         on dl."CtaRepositoryId" = tr."CtaRepositoryId"
+group by
+     tr.gbo_id;
+
+
+drop table if exists "tt_leasing_transf"; -- ищем первую дату передачи по текущему проекту
+create temp table "tt_leasing_transf" as
+select 
+  sp."Номер проекта"
+ ,sp."BranchId"
+ ,min (dl."ДатаПередачи") :: date "Первая дата передачи" 
+from 
+     dwh."SAFO_Project" sp
+    
+---------
+left join dwh."IC_ДоговорЛизинга" dl
+   on sp."Номер проекта" = dl."ProjectId"
+
+group by 
+  sp."Номер проекта"
+ ,sp."BranchId"
+  ;
+
+
+drop table if exists tt_cte_repeat_final; -- собираем все вместе с смотрим, соответствует ли дата передачи по текущему проекту первой дате передачи по ГК
+create temp table tt_cte_repeat_final as
+select 
+  distinct tapd."Номер проекта"
+   
+    ,tapd."CtaRepositoryId"
+    ,tr."gbo_id"
+    ,lt2."BranchId"
+    ,case 
+     when tnog."first_transfer_by_gbo" = lt2."Первая дата передачи" then '0'
+     when tnog."first_transfer_by_gbo" is null then '0'
+     else '1'
+    end "Повторный клиент по ЮЛ/ГК"
+from 
+      tt_all_projects_data tapd
+left join tt_leasing_transf lt2
+     on lt2."Номер проекта" = tapd."Номер проекта"
+join tt_rep tr 
+           on tapd."CtaRepositoryId" = tr."CtaRepositoryId" 
+    left join 
+       tt_new_gbo_or_old_gbo tnog
+        on tnog."gbo_id" = tr."gbo_id"
+;
+
+
+
+
+
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+-- выводим ПЛ из проекта
+--drop table if exists "tt_pl_for_project";
+--create temp table "tt_pl_for_project" as
+--select 
+--	 tapd."Номер проекта"
+--	,sl."КатегорияТС"
+--	,sl."Тип ПЛ"
+--	,sl."Марка"
+--	,row_number () over (partition by tapd."Номер проекта") "Номер ПЛ из проекта"
+--from "tt_all_projects_data" tapd
+--	 ---------
+--	 left join dwh."SAFO_LeasingItems" sl
+--	 	    on sl."НомерПроекта" = tapd."Номер проекта"
+--;
+--		
+
+
+		
+		
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+
+----------------------------------------------------------------------------------------------
+drop table if exists "tt_pre_final_1"; -- собираем инфо по проектам, МОП, Повторности контрагента
+create temp table "tt_pre_final_1" as
+select 
+	 tapd."Номер проекта"
+	,tapd."Дата создания проекта" 
+	,tpc."Канал продаж"
+	,tapd."Последняя дата работы над проектом" 
+	,tapd."Этап"
+	,tapd."Статус"
+	,tapd."Name" "Причина Архива"
+	,case 
+		when tapd."Name"= 'Отправлен в архив системой по истечении максимального срока бездействия по проекту' then 1
+		else 0
+	end "Автоархив"
+	,tapd."Description" "Комментарий при Архивации проекта"
+	,tapdps."Предыдущий статус проекта"
+	,tapdps."Предыдущая дата работы над проектом" 
+	,tapd."CtaRepositoryId"
+	,tapd."BranchId"
+	,tcrf."Повторный клиент по ЮЛ/ГК"
+	,case 
+		when tmfp."Подразделение" = 'Сектор прямых продаж ДКС' then 'Проект на МПП ДКС'
+		else 'Проект на другой функции'
+	end "МПП"
+	,tmfp."Сотрудник"
+	,tmfp."Должность"
+	,tmfp."Подразделение"
+	,tmfp."Логин"
+	,case 
+		when tmfp."Наименование отдела" = 'Отдел по работе с клиентами ЛО (Рудыкин Д.)' then 'ЦД Ленинградская область'
+		when tmfp."Центр прибыли" != 'УРК МО' and tmfp."Дивизион" = 'Дивизион Москва' then 'Москва'
+		when tmfp."Центр прибыли" ='УРК МО' and tmfp."Дивизион" = 'Дивизион Москва' then 'Московская область'
+		else tmfp."Центр дохода"
+	end "ЦД"
+	--,tmfp."Центр дохода" "ЦД"
+	--,tmfp."Центр прибыли" "ЦП"
+	,case 
+		when tmfp."Центр прибыли" != 'УРК МО' and tmfp."Дивизион" = 'Дивизион Москва' then 'Москва'
+		when tmfp."Центр прибыли" ='УРК МО' and tmfp."Дивизион" = 'Дивизион Москва' then 'Московская область'
+		else tmfp."Центр прибыли"
+	end "ЦП"
+	,tmfp."Дивизион"
+	,case
+		when tp."Кол-во ТС в ЕП" > 0  or tp."Кол-во ТС НЕ в ЕП" > 0 then 1
+		else 0
+	end "Покупка где-либо"
+	,case
+		when tp."Кол-во ТС в ЕП" > 0  then 1
+		else 0
+	end "Покупка в ЕП"
+--	,tpfp."КатегорияТС"
+--	,tpfp."Тип ПЛ"
+--	,tpfp."Марка"
+--	,tpfp."Номер ПЛ из проекта"
+	,tp."Кол-во ТС в ЕП"
+	,tp."Кол-во ТС НЕ в ЕП"
+	,tp."Дата первой покупки в ЕП"
+	,tp."Дата первой покупки НЕ в ЕП"
+	,case 
+		when tlt."Первая дата передачи" is not null then 1
+		else 0
+	end "Передача"
+	,tlt."Первая дата передачи"
+	,tlt."ЧИ проекта"
+	,tlt."Кол-во переданных ДФЛ в проекте"
+	,concat('http://fo.europlan.ru/ctaCard/cta/', tapd."CtaRepositoryId") "Ссылка на карту контрагента"
+	,row_number () over (partition by tapd."Номер проекта") "Проект"
+	,dbti."Был статус Требует согласования"
+	,dbti."Возвращен в КЦ"
+	,dbti."Назначена встреча"
+	,case 
+		when tpp."Номер проекта" is not null then 1
+		else 0
+	 end "Было подготовлено ПЛ"
+	,case 
+		when twc."Время звонка" is not null then 1
+		else 0
+	 end "Был результативный звонок"
+	,tpp."Дата подготовки первого ПЛ"
+	,twc."Время звонка"
+from  "tt_all_projects_data" tapd
+	 ---------
+	 left join "tt_cte_repeat_final" tcrf -- подтянули повторность
+			on tcrf."Номер проекта" = tapd."Номер проекта"
+	 ---------
+	 left join "tt_mop_for_projects" tmfp
+			on tmfp."Номер проекта" = tapd."Номер проекта"
+	 -------
+	 left join ds."DCC_Tasks_BA_Info" dbti -- подтянули признак согласования и встречи по проекту ДКС
+		    on dbti."ProjectId" = tapd."Номер проекта"
+	 ---------
+	 left join "tt_leasing_transfer" tlt --подтягиваем передачи по проекту, ЧИ
+			on tlt."Номер проекта" = tapd."Номер проекта"
+	 ---------	
+	 left join "tt_purchases" tp  -- подтянули покупки в ТС
+			on tp."Номер проекта" = tapd."Номер проекта"
+	 ---------	
+	 left join "tt_project_channels" tpc -- подтягиваем канал продаж (4 варианта: Входящий, Исходящий, Поставщики, МОП)
+			on tpc."Номер проекта" = tapd."Номер проекта"
+	 ---------
+	 left join "tt_all_projects_data_previous_status" tapdps -- подтягиваем предыдущий статус по проекту до архива (текущий статус)
+	 		on tapdps."Номер проекта" = tapd."Номер проекта"
+	--------
+	left join "tt_projects_postponed" tpp
+    on tpp."Номер проекта" = tapd."Номер проекта"
+	 ---------
+    left join "tt_cwc" twc
+    on twc."Номер проекта"= tapd."Номер проекта"
+--	 left join "tt_pl_for_project" tpfp
+--	 	    on tpfp."Номер проекта" = tapd."Номер проекта"
+;
+-------------------------------------------------------------------
+drop table if exists "tt_for_workingtimeinperiods"; --- select * from "tt_For_WorkingTimeInPeriods"
+create temp table "tt_for_workingtimeinperiods" as 
+select tcw."Номер проекта" as "Id"
+, tcw."Логин" as "Login"
+, tcw."Дата создания проекта"::timestamptz  as "DateFrom"
+ ,tcw."Время звонка"::timestamptz  as "DateTo"
+from "tt_pre_final_1" tcw;
+
+drop table if exists "tt_Result_FT_WorkingTimeInPeriods";
+create temp table "tt_Result_FT_WorkingTimeInPeriods" as
+select * from dwh."FT_WorkingTimeInPeriods"();
+---------------------------------------------------------------
+drop table if exists "tt_pre_final_2"; --- select * from "tt_For_WorkingTimeInPeriods"
+create temp table "tt_pre_final_2" as 
+select 
+prf.*
+,wtp."WorkingHours" "Рабочих часов до звонка МОП"
+,wtp."WorkingInterval" "Интервал часов до звонка МОП"
+from "tt_pre_final_1" prf
+left join "tt_Result_FT_WorkingTimeInPeriods" wtp
+on wtp."Id"=prf."Номер проекта";
+
+
+------------------------------------------------------------------------------
+drop table if exists "tt_for_workingtimeinperiods"; --- select * from "tt_For_WorkingTimeInPeriods"
+create temp table "tt_for_workingtimeinperiods" as 
+select tcw."Номер проекта" as "Id"
+, tcw."Логин" as "Login"
+, tcw."Дата создания проекта"::timestamptz  as "DateFrom"
+ ,tcw."Дата подготовки первого ПЛ"::timestamptz  as "DateTo"
+from "tt_pre_final_1" tcw;
+
+drop table if exists "tt_Result_FT_WorkingTimeInPeriods";
+create temp table "tt_Result_FT_WorkingTimeInPeriods" as
+select * from dwh."FT_WorkingTimeInPeriods"();
+----------------------------------------------------------------------------
+drop table if exists "tt_pre_final_3"; --- select * from "tt_For_WorkingTimeInPeriods"
+create temp table "tt_pre_final_3" as 
+select 
+prf.*
+,wtp."WorkingHours" "Рабочих часов до подготовки ПЛ"
+,wtp."WorkingInterval" "Интервал часов до подготовки ПЛ"
+from "tt_pre_final_2" prf
+left join "tt_Result_FT_WorkingTimeInPeriods" wtp
+on wtp."Id"=prf."Номер проекта";
+-------------------------------------------------------------------------------
+-------------------------------------------------------------------------------
+--финализирующая таблица с данными по всем проектам и с настройками, которые были запрошены 
+ -- собираем инфо по проектам, МОП, Повторности контрагента
+
+select 
+	tpf1."Номер проекта"
+	,tpf1."Дата создания проекта"
+	,tpf1."Канал продаж"
+--	,tpf1."CtaRepositoryId"
+--	,tpf1."BranchId"
+	,tpf1."Повторный клиент по ЮЛ/ГК"
+	,tpf1."МПП"
+	,tpf1."Сотрудник"
+	,tpf1."Должность"
+	,tpf1."Подразделение"
+	,tpf1."ЦД"
+	,tpf1."ЦП"
+	,tpf1."Дивизион"	
+	,tpf1."Покупка где-либо"
+	,tpf1."Покупка в ЕП"
+	,tpf1."Кол-во ТС в ЕП"
+	,tpf1."Кол-во ТС НЕ в ЕП"
+	,tpf1."Передача"
+	,tpf1."ЧИ проекта"
+	,tpf1."Автоархив"
+	,tpf1."Рабочих часов до подготовки ПЛ"
+	,case 
+		when tpf1."Рабочих часов до звонка МОП">0 and tpf1."Рабочих часов до звонка МОП"<40 then tpf1."Рабочих часов до звонка МОП" else 0
+	end "Рабочих часов до первого результативного звонка"
+	,tpf1."Было подготовлено ПЛ"
+	,tpf1."Был результативный звонок"
+	,1 "Один"
+from "tt_pre_final_3"  tpf1
+where tpf1."Канал продаж" in ('Входящие' , 'Исходящие')
+and "ЦД" != 'Дивизион ДКС'
+;
+
+
 
