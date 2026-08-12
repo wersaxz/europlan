@@ -1,8 +1,9 @@
 with params as (
     select
-         50::numeric   as wpm_type       -- скорость печати, слов/мин
-        ,3.5::numeric  as voice_speedup  -- во сколько раз голос быстрее печати
-        ,0.25::numeric as review_share   -- доля перепроверки от времени надиктовки (25%)
+         55.4::numeric  as wpm_type           -- скорость печати оператора, слов/мин (подтверждено)
+        ,140::numeric   as voice_wpm          -- скорость голосового ввода, слов/мин (из открытых источников)
+        ,0.25::numeric  as review_share       -- доля перечитки транскрипта от времени надиктовки
+        ,0.10::numeric  as recognition_share  -- доля на распознавание/ввод (600 сек надиктовки → ~60 сек = 10%)
 )
 ,filtered as (
     select
@@ -81,12 +82,13 @@ select
     ,d.comment                                               as "comment"
     ,d.words                                                 as "Words"
     ,round(d.words / p.wpm_type * 60, 1)                     as "sec_type"        -- время печати, сек
-    ,round(d.words / p.wpm_type * 60 / p.voice_speedup, 1)   as "sec_voice_raw"   -- надиктовка, сек
-    ,round(d.words / p.wpm_type * 60 / p.voice_speedup * p.review_share, 1) as "sec_review"  -- перепроверка, сек
-    ,round(d.words / p.wpm_type * 60 / p.voice_speedup * (1 + p.review_share), 1) as "sec_voice_total"  -- голос всего, сек
+    ,round(d.words / p.voice_wpm * 60, 1)                    as "sec_voice_raw"   -- надиктовка, сек (140 WPM)
+    ,round(d.words / p.voice_wpm * 60 * p.recognition_share, 1) as "sec_recognition"  -- распознавание/ввод, сек
+    ,round(d.words / p.voice_wpm * 60 * p.review_share, 1)   as "sec_review"      -- перечитка транскрипта, сек
+    ,round(d.words / p.voice_wpm * 60 * (1 + p.recognition_share + p.review_share), 1) as "sec_voice_total"  -- голос всего, сек
     ,round(
         d.words / p.wpm_type * 60
-      - d.words / p.wpm_type * 60 / p.voice_speedup * (1 + p.review_share)
+      - d.words / p.voice_wpm * 60 * (1 + p.recognition_share + p.review_share)
      , 1)                                                    as "sec_saved"       -- экономия (А), сек
 from dedup d
 cross join params p
