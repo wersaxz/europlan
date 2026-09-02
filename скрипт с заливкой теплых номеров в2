@@ -1,31 +1,119 @@
--- 1) Проверка итоговой цифры 118 тыс. / 115 тыс. и разбивки по каналу
-select
-     "Источник банк"
-    ,count(*)                          as rows_cnt
-    ,count(distinct number_telephone)  as numbers_cnt      -- ожидаем ~118 тыс. в сумме
-    ,count(distinct "инн_контрагента") as clients_cnt       -- ожидаем ~115 тыс. в сумме
-from "fin"
-where "Заливаем в 3 волну" = 1   -- версия С условием на успешный контакт
-group by "Источник банк"
-order by "Источник банк" desc;
+--================================================================
+-- 0. Нормализованная база для счёта: пара (ИНН, номер) без дублей строк
+--================================================================
+drop table if exists "chk_base";
+create temp table "chk_base" as
+select distinct
+     f."инн_контрагента"
+    ,f."CtaRepositoryId"
+    ,f."number_telephone"
+    ,max(f."Источник банк")                          as "Источник банк"
+    ,max(f."project_flag_ul")                        as "project_flag_ul"
+    ,max(f."successful_contact_last_year")           as "successful_contact_last_year"
+    ,max(f."already_has")                            as "already_has"
+    ,max(f."phone_conflict")                         as "phone_conflict"
+    ,min(f."chk_phone_valid" * f."chk_inn_valid" * f."chk_name_filled") as "chk_all_valid"
+    ,max(f."Заливаем в 3 волну")                     as "wave3"
+    ,max(f."Заливаем в 3 волну без условия на наличие успешного контакта") as "wave3_no_contact_cond"
+from "fin" f
+group by 1,2,3
+;
 
--- 2) То же самое, но в процентах от общего итога
+--================================================================
+-- 1. Сверка верхнеуровневых цифр: 249 тыс. номеров / 237 тыс. клиентов
+--================================================================
 select
-     "Источник банк"
-    ,count(distinct number_telephone) as numbers_cnt
-    ,round(
-        count(distinct number_telephone) * 100.0
-        / sum(count(distinct number_telephone)) over (), 1
-     ) as pct_of_total
-from "fin"
-where "Заливаем в 3 волну" = 1
-group by "Источник банк";
+     count(*)                                   as "Номеров всего (пар ИНН-номер)"
+    ,count(distinct "number_telephone")          as "Уникальных номеров"
+    ,count(distinct "инн_контрагента")           as "Клиентов (ИНН)"
+    ,count(distinct "CtaRepositoryId")           as "Клиентов (CtaRepositoryId)"
+    ,sum("wave3")                                as "Заливаем в 3 волну (118 тыс.?)"
+    ,count(*) - sum("wave3")                     as "Отсекается (131 тыс.?)"
+    ,round(sum("wave3")::numeric / nullif(count(*),0) * 100, 1) as "% к заливке (47%?)"
+from "chk_base"
+;
 
--- 3) Контрольная проверка воронки исключений (131 тыс.)
+--================================================================
+-- 2. Разбивка отсечённых по приоритету причин (99 / 13 / 17 / 2 тыс.)
+--    Приоритет взят в порядке заключения; причины пересекаются,
+--    без приоритизации сумма будет больше 131 тыс.
+--================================================================
 select
-     count(*) filter (where successful_contact_last_year = 1)      as excl_successful_contact  -- ожидаем ~99 тыс.
-    ,count(*) filter (where phone_conflict = 1)                    as excl_phone_conflict        -- ожидаем ~13 тыс.
-    ,count(*) filter (where already_has = 1)                       as excl_already_has           -- ожидаем ~17 тыс.
-    ,count(*) filter (where chk_phone_valid = 0 or chk_inn_valid = 0
-                        or chk_name_filled = 0)                     as excl_invalid                -- ожидаем ~2 тыс.
-from "filter";
+     case
+        when "successful_contact_last_year" = 1 then '1. Успешный контакт в ЕП за год'
+        when "phone_conflict" = 1               then '2. Конфликтный номер'
+        when "already_has" = 1                  then '3. Номер уже есть у клиента'
+        when "chk_all_valid" = 0                then '4. Невалидный номер/ИНН/ФИО'
+        else '5. Прочее (разобраться)'
+     end as "Причина отсечения"
+    ,count(*)                          as "Номеров"
+    ,count(distinct "инн_контрагента") as "Клиентов"
+from "chk_base"
+where "wave3" = 0
+group by 1
+order by 1
+;
+
+--================================================================
+-- 3. ГЛАВНОЕ: разрез 118 тыс. на Банк / Небанк с фильтром «касание»
+--    Гипотеза: касание = project_flag_ul = 1 (лида в скрипте нет)
+--================================================================
+select
+     case when "Источник банк" = 1 then 'Банк' else 'Небанк' end as "Канал источника данных"
+    ,count(*) filter (where "project_flag_ul" = 1)          as "С касанием (проект)"
+    ,count(*) filter (where "project_flag_ul" = 0)          as "Без касания"
+    ,count(*)                                                as "Всего номеров"
+    ,count(distinct "инн_контрагента") filter (where "project_flag_ul" = 1) as "Клиентов с касанием"
+    ,count(distinct "инн_контрагента")                       as "Клиентов всего"
+from "chk_base"
+where "wave3" = 1
+group by 1
+order by 1
+;
+
+--================================================================
+-- 4. Сводка «попали / не попали» в заявленные 81 361 и 31 109
+--================================================================
+with c as (
+    select
+         sum(case when "Источник банк" = 1 and "project_flag_ul" = 1 then 1 else 0 end) as bank_touch
+        ,sum(case when "Источник банк" = 0 and "project_flag_ul" = 1 then 1 else 0 end) as nonbank_touch
+        ,sum(case when "Источник банк" = 1 then 1 else 0 end)                            as bank_all
+        ,sum(case when "Источник банк" = 0 then 1 else 0 end)                            as nonbank_all
+        ,count(*)                                                                        as wave3_total
+    from "chk_base"
+    where "wave3" = 1
+)
+select 'Банк, с касанием'      as "Метрика", bank_touch    as "Факт", 81361 as "Заявлено", bank_touch    - 81361 as "Дельта" from c
+union all
+select 'Небанк, с касанием',        nonbank_touch,  31109,  nonbank_touch  - 31109  from c
+union all
+select 'Банк, без фильтра касания', bank_all,       81361,  bank_all       - 81361  from c
+union all
+select 'Небанк, без фильтра касания', nonbank_all,  31109,  nonbank_all    - 31109  from c
+union all
+select 'Итого 3 волна',             wave3_total,    118000, wave3_total    - 118000 from c
+;
+
+--================================================================
+-- 5. Контроль взаимоисключаемости разреза:
+--    сколько ИНН имеют одновременно альфа- и не-альфа источники
+--================================================================
+select
+     count(*) filter (where has_alfa = 1 and has_other = 1) as "ИНН с обоими источниками"
+    ,count(*) filter (where has_alfa = 1 and has_other = 0) as "Только альфа"
+    ,count(*) filter (where has_alfa = 0 and has_other = 1) as "Только не-альфа"
+from (
+    select
+         x."ИНН"
+        ,max(case when x."ИсточникОбращения" in (
+                 'Альфа-Страхование','Альфа-банк (СКБ)','Альфа-босс','Менеджер Альфа-Банка'
+             ) then 1 else 0 end) as has_alfa
+        ,max(case when x."ИсточникОбращения" not in (
+                 'Альфа-Страхование','Альфа-банк (СКБ)','Альфа-босс','Менеджер Альфа-Банка'
+             ) then 1 else 0 end) as has_other
+    from alfa_temp."CtaContacts" x
+    where exists (select 1 from "chk_base" b where b."инн_контрагента" = x."ИНН"::text and b."wave3" = 1)
+    group by x."ИНН"
+) t
+;
