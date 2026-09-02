@@ -1,19 +1,35 @@
 --================================================================
--- Клиенты сегмента «Банк» (3 волна) с хотя бы 1 покупкой за 3 года
+-- Сверка: клиенты сегмента «Банк» (3 волна) в разрезе наличия покупок
 --================================================================
-select count(distinct b."инн_контрагента") as "Клиентов с покупкой за 3 года"
-from "chk_base" b
-where b."wave3" = 1
-  and b."Источник банк" = 1
-  and exists (
-        select 1
-        from dwh."Cta_Counteragents" cc
-        join dwh."AllPurchases" ap
-          on ap."CtaRepositoryId" = cc."CtaRepositoryId"
-         and ap."ActualRow" = 1
-         and ap."ДатаПокупки" >= current_date - interval '3 years'
-         and ap."ДатаПокупки" <  current_date
-        where cc."INN" = b."инн_контрагента"
-          and cc."RemovedAt" is null
-      )
+with base as (
+    select distinct b."инн_контрагента"
+    from "chk_base" b
+    where b."wave3" = 1
+      and b."Источник банк" = 1
+),
+purch as (
+    select
+         t."инн_контрагента"
+        ,max(ap."ДатаПокупки") as last_purchase_date
+    from base t
+    join dwh."Cta_Counteragents" cc
+        on cc."INN" = t."инн_контрагента"
+       and cc."RemovedAt" is null
+    join dwh."AllPurchases" ap
+        on ap."CtaRepositoryId" = cc."CtaRepositoryId"
+       and ap."ActualRow" = 1
+       and ap."ДатаПокупки" < current_date
+    group by 1
+)
+select
+     count(*)                                                                          as "Всего клиентов в сегменте"
+    ,count(p."инн_контрагента") filter (where p.last_purchase_date >= current_date - interval '3 years') as "С покупкой за 3 года"
+    ,count(p."инн_контрагента") filter (where p.last_purchase_date >= current_date - interval '5 years') as "С покупкой за 5 лет"
+    ,count(p."инн_контрагента") filter (where p.last_purchase_date >= current_date - interval '7 years') as "С покупкой за 7 лет"
+    ,count(p."инн_контрагента")                                                        as "С покупкой за любое время"
+    ,count(*) - count(p."инн_контрагента")                                             as "Без покупки вообще"
+    ,count(p."инн_контрагента") + (count(*) - count(p."инн_контрагента"))              as "Контроль: сумма = всего"
+from base t
+left join purch p
+    on p."инн_контрагента" = t."инн_контрагента"
 ;
