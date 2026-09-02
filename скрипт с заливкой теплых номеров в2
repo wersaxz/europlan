@@ -1,0 +1,31 @@
+-- 1) Проверка итоговой цифры 118 тыс. / 115 тыс. и разбивки по каналу
+select
+     "Источник банк"
+    ,count(*)                          as rows_cnt
+    ,count(distinct number_telephone)  as numbers_cnt      -- ожидаем ~118 тыс. в сумме
+    ,count(distinct "инн_контрагента") as clients_cnt       -- ожидаем ~115 тыс. в сумме
+from "fin"
+where "Заливаем в 3 волну" = 1   -- версия С условием на успешный контакт
+group by "Источник банк"
+order by "Источник банк" desc;
+
+-- 2) То же самое, но в процентах от общего итога
+select
+     "Источник банк"
+    ,count(distinct number_telephone) as numbers_cnt
+    ,round(
+        count(distinct number_telephone) * 100.0
+        / sum(count(distinct number_telephone)) over (), 1
+     ) as pct_of_total
+from "fin"
+where "Заливаем в 3 волну" = 1
+group by "Источник банк";
+
+-- 3) Контрольная проверка воронки исключений (131 тыс.)
+select
+     count(*) filter (where successful_contact_last_year = 1)      as excl_successful_contact  -- ожидаем ~99 тыс.
+    ,count(*) filter (where phone_conflict = 1)                    as excl_phone_conflict        -- ожидаем ~13 тыс.
+    ,count(*) filter (where already_has = 1)                       as excl_already_has           -- ожидаем ~17 тыс.
+    ,count(*) filter (where chk_phone_valid = 0 or chk_inn_valid = 0
+                        or chk_name_filled = 0)                     as excl_invalid                -- ожидаем ~2 тыс.
+from "filter";
