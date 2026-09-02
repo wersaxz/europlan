@@ -1,0 +1,446 @@
+
+drop table if exists "base"; --select * from "base" select * from alfa_temp."CtaContacts"
+create temp table "base" as 
+WITH project_contragents AS (
+   select a."CtaRepositoryId"
+,b."INN"
+-- ,a."Номер проекта" 
+-- ,a."Статус" 
+,max(a."Дата создания проекта") as max_project_date
+from dwh."SAFO_Project" a
+inner join dwh."Cta_Counteragents" b on b."CtaRepositoryId" =a."CtaRepositoryId" 
+group by 1,2--,3,4
+),
+successful_contacts AS (
+    SELECT DISTINCT
+        cwc."CtaRepositoryId"
+    FROM dwh."ContactsWithCounteragents" cwc
+    WHERE cwc."Answered" = 1
+      AND cwc."event_datetime_utc" >= current_date - interval '1 year'
+),
+bank_source AS (
+    SELECT
+        "ИНН",
+        1 AS "Источник банк"
+    FROM alfa_temp."CtaContacts"
+    WHERE "ИсточникОбращения" IN (
+        'Альфа-Страхование',
+        'Альфа-банк (СКБ)',
+        'Альфа-босс',
+        'Менеджер Альфа-Банка'
+    )
+    GROUP BY "ИНН"
+)
+select 
+distinct a."ИНН" as "инн_контрагента" ,
+a."КонтактноеЛицоФамилия" as "фамилия",
+a. "КонтактноеЛицоИмя" as "имя",
+a."КонтактноеЛицоОтчество" as "отчество",
+a."Должность" as "должность",
+regexp_replace(substring(a."ТелефонКЛ" from 2), '[^0-9]', '', 'g')  as number_telephone,
+ CASE
+    WHEN EXISTS (
+        SELECT 1
+        FROM alfa_temp."CtaContacts" x
+        WHERE x."ИНН" = a."ИНН"
+          AND x."ИсточникОбращения" IN (
+              'Альфа-Страхование',
+              'Альфа-банк (СКБ)',
+              'Альфа-босс',
+              'Менеджер Альфа-Банка'
+          )
+    )
+    THEN 1
+    ELSE 0
+END AS "Источник банк"
+--,c."email" as email
+,case when b.max_project_date is null then 0 else 1 end project_flag_UL
+,b.max_project_date,
+case when sc."CtaRepositoryId" is not null then 1 else 0 end
+        as successful_contact_last_year,
+        cc."CtaRepositoryId"
+from alfa_temp."CtaContacts" a 
+left join dwh."Cta_Counteragents" cc on cc."INN" = a."ИНН" and cc."RemovedAt" is null
+left join project_contragents b on b."INN"=a."ИНН"
+--left join project_contragents f on f."INN"=a."инн_физ_лица"
+--left join ds.directory_non_identified_emails  c on c.инн_контрагента =a.инн_контрагента 
+left join successful_contacts sc
+    on sc."CtaRepositoryId" = b."CtaRepositoryId"
+where a."Контрагент" is not null ;
+
+drop table if exists phone_links_stat;
+
+create temp table phone_links_stat as
+
+select
+    pl."CounteragentId" as "CtaRepositoryId",
+    pl."Number"
+from cta."PhoneLinks" pl
+where pl."RemovedAt" is null
+  and pl."CounteragentId" is not null
+
+union
+
+select
+    pl."Payload_counteragentId" as "CtaRepositoryId",
+    pl."Number"
+from cta."PhoneLinks" pl
+where pl."RemovedAt" is null
+  and pl."Payload_counteragentId" is not null;
+
+create index idx_phone_links_stat_cta_number
+    on phone_links_stat("CtaRepositoryId", "Number");
+
+create index idx_phone_links_stat_number
+    on phone_links_stat("Number");
+
+
+
+drop table if exists "filter"; --select * from "filter"
+create temp table "filter" as 
+with validation as (
+
+    select distinct
+        b.*,
+
+        /* ---------------- ФИО ---------------- */
+
+       case
+    when (
+        (
+            trim(coalesce(b."имя", '')) not in ('', '<Пустая строка>')
+            and length(trim(b."имя")) >= 3
+            and lower(trim(b."имя")) !~ '^(.)(\1)+$'
+        )
+        or
+        (
+            trim(coalesce(b."фамилия", '')) not in ('', '<Пустая строка>')
+            and length(trim(b."фамилия")) >= 3
+            and lower(trim(b."фамилия")) !~ '^(.)(\1)+$'
+        )
+    )
+    then 1
+    else 0
+end as chk_name_filled,
+
+        /* ---------------- Телефон ---------------- */
+
+        case
+            when b.number_telephone ~ '^[0-9]{10}$'
+            then 1
+            else 0
+        end as chk_phone_10_digits,
+        
+        /* ---------------- Проверка на реальный российский номер (с учетом стационарных кодов) ---------------- */
+
+case
+    when b.number_telephone ~ '^[0-9]{10}$'
+    and (
+        -- Мобильные коды 9xx
+        substring(b.number_telephone, 1, 3) in (
+          '900','901','902','903','904','905','906','907','908','909',
+'910','911','912','913','914','915','916','917','918','919',
+'920','921','922','923','924','925','926','927','928','929',
+'930','931','932','933','934','936','937','938','939',
+'344','345','346','347','348','349',
+'950','951','952','953','958','959',
+'960','961','962','963','964','965','966','967','968','969',
+'976','977','978',
+'980','981','982','983','984','985','986','987','988','989',
+'991','992','993','994','995','996','999', '935','955','956','957','972','974','990','998'
+        )
+        -- Городские коды на 3 (стационарные)
+        or substring(b.number_telephone, 1, 3) in (
+            '301','302','341','342','343','351','352','353','381','383',
+            '384','385','388','391','394','395','401','421','471','472',
+            '473','474','475','481','482','483','484','485','486','487',
+            '491','492','493','494','495','496','498','499',
+             '390','411','413','415','423','424','427','428'
+        )
+        -- Городские коды на 4 (стационарные — бывшие 0**)
+        or substring(b.number_telephone, 1, 3) in (
+            '401','471','472','473','474','475','481','482','483','484',
+            '485','486','487','491','492','493','494','495'
+        )
+        -- Городские коды на 8 (стационарные)
+        or substring(b.number_telephone, 1, 3) in (
+            '800','811','812','813','814','815','816','817','818','831',
+            '833','834','835','836','841','842','843','844','845','846',
+            '847','848','851','855','856','861','862','863','865','866',
+            '867','869','871','872','873','877','878','879','881','882'
+        )
+    )
+    then 1
+    else 0
+end as chk_phone_russian_code,
+
+
+      case
+            when b.number_telephone is not null and b.number_telephone !~ '([0-9])\1{5}'
+            then 1 else 0
+        end as chk_phone_not_same, -- нет 6 подряд одинаковых цирф
+
+        case
+            when b.number_telephone not in (
+                '0000000000',
+                '1111111111',
+                '2222222222',
+                '3333333333',
+                '4444444444',
+                '5555555555',
+                '6666666666',
+                '7777777777',
+                '8888888888',
+                '9999999999',
+                '1234567890',
+                '9876543210',
+                '1234567891',
+                '1234567899',
+                '1234567889',
+                '1122211222',
+				'1122222222',
+				'211111111',
+				'199999528'
+            )
+            then 1
+            else 0
+        end as chk_phone_not_test,
+
+        /* Итоговая валидность телефона */
+
+        case
+            when b.number_telephone ~ '^[0-9]{10}$'
+             and b.number_telephone is not null and b.number_telephone !~ '([0-9])\1{5}'
+             and b.number_telephone not in (
+                '0000000000',
+                '1111111111',
+                '2222222222',
+                '3333333333',
+                '4444444444',
+                '5555555555',
+                '6666666666',
+                '7777777777',
+                '8888888888',
+                '9999999999',
+                '1234567890',
+                '9876543210',
+                '1234567891',
+                '1234567899',
+                '1234567889',
+                '1122211222',
+				'1122222222',
+				'211111111',
+				'199999528'
+            
+             )
+           
+    and (
+        -- Мобильные коды 9xx
+        substring(b.number_telephone, 1, 3) in (
+           
+'900','901','902','903','904','905','906','907','908','909',
+'910','911','912','913','914','915','916','917','918','919',
+'920','921','922','923','924','925','926','927','928','929',
+'930','931','932','933','934','936','937','938','939',
+'344','345','346','347','348','349',
+'950','951','952','953','958','959',
+'960','961','962','963','964','965','966','967','968','969',
+'976','977','978',
+'980','981','982','983','984','985','986','987','988','989',
+'991','992','993','994','995','996','999', '935','955','956','957','972','974','990','998'
+        )
+        -- Городские коды на 3 (стационарные)
+        or substring(b.number_telephone, 1, 3) in (
+            '301','302','341','342','343','351','352','353','381','383',
+            '384','385','388','391','394','395','401','421','471','472',
+            '473','474','475','481','482','483','484','485','486','487',
+            '491','492','493','494','495','496','498','499',
+            '390','411','413','415','423','424','427','428'
+        )
+        -- Городские коды на 4 (стационарные — бывшие 0**)
+        or substring(b.number_telephone, 1, 3) in (
+            '401','471','472','473','474','475','481','482','483','484',
+            '485','486','487','491','492','493','494','495'
+        )
+        -- Городские коды на 8 (стационарные)
+        or substring(b.number_telephone, 1, 3) in (
+            '800','811','812','813','814','815','816','817','818','831',
+            '833','834','835','836','841','842','843','844','845','846',
+            '847','848','851','855','856','861','862','863','865','866',
+            '867','869','871','872','873','877','878','879','881','882'
+        )
+    )
+            then 1
+            else 0
+        end as chk_phone_valid,
+
+        /* ---------------- ИНН ---------------- */
+
+        case
+            when b."инн_контрагента" is not null
+            then 1
+            else 0
+        end as chk_inn_exists,
+
+        case
+            when b."инн_контрагента"::text ~ '^[0-9]+$'
+            then 1
+            else 0
+        end as chk_inn_digits,  -- проверка, что ИНН только из цифр
+
+        case
+            when length(b."инн_контрагента"::text) in (10,12)
+            then 1
+            else 0
+        end as chk_inn_length,
+
+        /* Контрольная сумма ИНН ЮЛ */
+
+        case
+            when b."инн_контрагента"::text ~ '^[0-9]{10}$'
+             and
+             (
+                (
+                  substring(b."инн_контрагента"::text,1,1)::int * 2 +
+                  substring(b."инн_контрагента"::text,2,1)::int * 4 +
+                  substring(b."инн_контрагента"::text,3,1)::int * 10 +
+                  substring(b."инн_контрагента"::text,4,1)::int * 3 +
+                  substring(b."инн_контрагента"::text,5,1)::int * 5 +
+                  substring(b."инн_контрагента"::text,6,1)::int * 9 +
+                  substring(b."инн_контрагента"::text,7,1)::int * 4 +
+                  substring(b."инн_контрагента"::text,8,1)::int * 6 +
+                  substring(b."инн_контрагента"::text,9,1)::int * 8
+                ) % 11 % 10
+             )
+             =
+             substring(b."инн_контрагента"::text,10,1)::int
+            then 1
+            else 0
+        end as chk_inn10_control,
+
+        /* Контрольная сумма ИНН ФЛ */
+
+        case
+            when b."инн_контрагента"::text ~ '^[0-9]{12}$'
+             and
+             (
+                (
+                    7*substring(b."инн_контрагента"::text,1,1)::int +
+                    2*substring(b."инн_контрагента"::text,2,1)::int +
+                    4*substring(b."инн_контрагента"::text,3,1)::int +
+                    10*substring(b."инн_контрагента"::text,4,1)::int +
+                    3*substring(b."инн_контрагента"::text,5,1)::int +
+                    5*substring(b."инн_контрагента"::text,6,1)::int +
+                    9*substring(b."инн_контрагента"::text,7,1)::int +
+                    4*substring(b."инн_контрагента"::text,8,1)::int +
+                    6*substring(b."инн_контрагента"::text,9,1)::int +
+                    8*substring(b."инн_контрагента"::text,10,1)::int
+                ) % 11 % 10
+             )
+             =
+             substring(b."инн_контрагента"::text,11,1)::int
+            then 1
+            else 0
+        end as chk_inn12_control
+        
+
+    from "base" b
+
+)
+select distinct
+    v.*,
+    case
+        when coalesce(v.chk_inn10_control,0) = 1
+          or coalesce(v.chk_inn12_control,0) = 1
+        then 1
+        else 0
+    end as chk_inn_valid,
+    
+    /* Валидность ИНН физлица */
+
+case
+    when pls."Number" is not null
+    then 1
+    else 0
+end as already_has,
+
+case
+    when pls."Number" is null
+     and cta_phones."CtaRepositoryId" is not null
+    then 1
+    else 0
+end as phone_conflict
+
+from validation v
+
+left join phone_links_stat pls
+    on pls."CtaRepositoryId" = v."CtaRepositoryId"
+   and pls."Number" = v.number_telephone
+
+left join (
+    select distinct
+        "CtaRepositoryId"
+    from phone_links_stat
+) cta_phones
+    on cta_phones."CtaRepositoryId" = v."CtaRepositoryId";
+
+   
+   drop table if exists "fin"; -- select * from "fin"
+create temp table "fin" as 
+select distinct
+f."инн_контрагента"::text,
+f."фамилия",
+f."имя",
+f."отчество",
+f."CtaRepositoryId",
+--f."инн_физ_лица_norm" as "инн_физ_лица" ,
+f."должность",
+--f."дата_рождения",
+f."Источник банк",
+f."number_telephone",
+f."project_flag_ul",
+--f."project_flag_fl",
+f."successful_contact_last_year",
+f."chk_name_filled",
+f."chk_phone_10_digits",
+f."chk_phone_russian_code",
+f."chk_phone_not_same",
+f."chk_phone_not_test",
+f."chk_phone_valid",
+f."chk_inn_exists",
+f."chk_inn_digits",
+f."chk_inn_length",
+f."chk_inn10_control",
+f."chk_inn12_control",
+f."chk_inn_valid",
+f."already_has",
+f."phone_conflict",
+case when already_has = 0
+    and phone_conflict = 0
+	and chk_name_filled = 1
+	and chk_phone_valid = 1
+	and chk_inn_valid = 1
+	and successful_contact_last_year = 0
+	--and chk_fl_inn_valid = 1
+--	and  project_flag_UL = 1
+--	and cnt_inn_per_phone = 1
+	and chk_phone_russian_code = 1
+	then 1 else 0 end as "Заливаем в 3 волну",
+	case when already_has = 0
+    and phone_conflict = 0
+	and chk_name_filled = 1
+	and chk_phone_valid = 1
+	and chk_inn_valid = 1
+	--and successful_contact_last_year = 0
+	--and chk_fl_inn_valid = 1
+--	and  project_flag_UL = 1
+--	and cnt_inn_per_phone = 1
+	and chk_phone_russian_code = 1
+	then 1 else 0 end as "Заливаем в 3 волну без условия на наличие успешного контакта"
+from "filter" f;
+
+
+
+
+select * from "fin" f where "Заливаем в 3 волну без условия на наличие успешного контакта" = 1
+
