@@ -1,0 +1,43 @@
+set language russian;
+
+drop table if exists #sosh;
+select
+	*
+into
+	#sosh
+from
+	[Custom].FN_GetHierarchy_SafoOrgStructureHistory(null,getdate());
+
+drop table if exists #proba;
+select
+	*
+into
+	#proba
+from
+	openquery([db-warehouse-production],
+	'select "Номер задачи" as task_id
+	       ,"Вероятность по модели" as proba
+	 from ds."DCC_Tasks_Today_Proba"
+	 where "Вероятность по модели" is not null');
+
+select
+	ti.*
+	,iif([Класс закрывающего статуса] = 'Лизинг. Не удалось дозвониться',0,1) Завершена_с_дозвоном
+	,1 as odin
+	,lt.payload_type
+	,s.division_name [Дивизион МОП]
+	,s.profitcenter_name [ЦД МОП]
+	,s.revenuecenter_name [ЦП МОП]
+	,p.proba [Вероятность по модели]
+from 
+	report.dcc_ba_tasks_info ti
+	join WarehousePG.voipclient_leasing_task lt
+		on ti.[Номер задачи]=lt.id
+		and ti.[Дата завершения задачи] between '2026-04-01' and getdate()
+	left join WarehousePG.dwh_Сотрудники c
+		on ti.Userid = c.UserID_SAFO
+		and ActualRow=1
+	left join #sosh s
+		on c.SubdivisionId_SAFO_actual = s.subdivisionid
+	left join #proba p
+		on ti.[Номер задачи] = p.task_id;
