@@ -1,0 +1,81 @@
+drop table if exists dbo.proba_dcc_tasks;
+
+select
+	*
+into
+	dbo.proba_dcc_tasks
+from
+	openquery([db-warehouse-production],
+	'select "Номер задачи" as task_id
+	       ,"Вероятность по модели" as proba
+	 from ds."DCC_Tasks_Today_Proba"
+	 where "Вероятность по модели" is not null');
+
+
+
+
+create clustered index ix_proba_dcc_tasks on dbo.proba_dcc_tasks (task_id);
+
+
+
+
+
+
+set language russian;
+
+select
+	format(ti.[Дата создания задачи],'yyyy-MM') as [Месяц создания]
+	,count(*)          as [Задач]
+	,count(p.proba)    as [С вероятностью]
+from
+	report.dcc_ba_tasks_info ti
+	left join dbo.proba_dcc_tasks p
+		on ti.[Номер задачи] = p.task_id
+where
+	ti.[Дата завершения задачи] >= '2026-04-01'
+	and ti.[Канал] = 'Исходящие'
+group by
+	format(ti.[Дата создания задачи],'yyyy-MM')
+order by
+	1;
+
+
+
+
+
+
+
+
+
+
+set language russian;
+
+drop table if exists #sosh;
+select
+	*
+into
+	#sosh
+from
+	[Custom].FN_GetHierarchy_SafoOrgStructureHistory(null,getdate());
+
+select
+	ti.*
+	,iif([Класс закрывающего статуса] = 'Лизинг. Не удалось дозвониться',0,1) Завершена_с_дозвоном
+	,1 as odin
+	,lt.payload_type
+	,s.division_name [Дивизион МОП]
+	,s.profitcenter_name [ЦД МОП]
+	,s.revenuecenter_name [ЦП МОП]
+	,p.proba [Вероятность по модели]
+from 
+	report.dcc_ba_tasks_info ti
+	join WarehousePG.voipclient_leasing_task lt
+		on ti.[Номер задачи]=lt.id
+		and ti.[Дата завершения задачи] between '2026-04-01' and getdate()
+	left join WarehousePG.dwh_Сотрудники c
+		on ti.Userid = c.UserID_SAFO
+		and ActualRow=1
+	left join #sosh s
+		on c.SubdivisionId_SAFO_actual = s.subdivisionid
+	left join dbo.proba_dcc_tasks p
+		on ti.[Номер задачи] = p.task_id;
