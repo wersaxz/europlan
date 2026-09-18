@@ -1,0 +1,35 @@
+drop table if exists #sosh;
+select
+	*
+into
+	#sosh
+from
+	[Custom].FN_GetHierarchy_SafoOrgStructureHistory(null,getdate());
+
+--drop table if exists #final;
+select
+	ti.*
+	,iif([номер проекта] is null,0,1) Был_прямой_проект
+	,iif([Класс закрывающего статуса] = 'Лизинг. Не удалось дозвониться',0,1) Завершена_с_дозвоном
+	,iif([покупки не в ЕП в течение 135 дней после закрытия задачи]>0,1,0) [Факт покупки в лизинг в теч 135 дней]
+	,iif([покупки в лизинг в течение 135 дней после закрытия задачи]>0 and [номер проекта] is not null,1,0) [Факт покупки в лизинг в теч 135 дней в заведенных проектах ]
+	,iif([покупки в лизинг в течение 60 дней после закрытия задачи]>0 and [номер проекта] is not null,1,0) [Факт покупки в лизинг в теч 60 дней в заведенных проектах ]
+	,iif([покупки в ЕП в течение 135 дней после закрытия задачи]>0 and [номер проекта] is not null,1,0) [Факт покупки в ЕП в теч 135 дней в заведенных проектах ]
+	,iif([покупки в ЕП в течение 60 дней после закрытия задачи]>0 and [номер проекта] is not null,1,0) [Факт покупки в ЕП в теч 60 дней в заведенных проектах ]
+	,1 as odin
+	,lt.payload_type
+	,s.division_name [Дивизион МОП]
+	,s.profitcenter_name [ЦД МОП]
+	,s.revenuecenter_name [ЦП МОП]
+--into #final
+from 
+	report.dcc_ba_tasks_info ti
+	join WarehousePG.voipclient_leasing_task lt
+		on ti.[Номер задачи]=lt.id
+		and ti.[Дата завершения задачи] between '2025-10-01' and getdate()
+		and ti.[Класс закрывающего статуса] <> 'Лизинг. Не удалось дозвониться'
+	left join WarehousePG.dwh_Сотрудники c
+		on ti.Userid = c.UserID_SAFO
+		and ActualRow=1
+	left join #sosh s
+		on c.SubdivisionId_SAFO_actual = s.subdivisionid;
