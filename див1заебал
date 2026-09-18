@@ -1,9 +1,9 @@
-drop table if exists dbo.proba_dcc_tasks;
+drop table if exists ##proba_dcc_tasks;
 
 select
 	*
 into
-	dbo.proba_dcc_tasks
+	##proba_dcc_tasks
 from
 	openquery([db-warehouse-production],
 	'select "Номер задачи" as task_id
@@ -12,13 +12,7 @@ from
 	 where "Вероятность по модели" is not null');
 
 
-
-
-create clustered index ix_proba_dcc_tasks on dbo.proba_dcc_tasks (task_id);
-
-
-
-
+create clustered index ix_proba_dcc_tasks on ##proba_dcc_tasks (task_id);
 
 
 set language russian;
@@ -29,7 +23,7 @@ select
 	,count(p.proba)    as [С вероятностью]
 from
 	report.dcc_ba_tasks_info ti
-	left join dbo.proba_dcc_tasks p
+	left join ##proba_dcc_tasks p
 		on ti.[Номер задачи] = p.task_id
 where
 	ti.[Дата завершения задачи] >= '2026-04-01'
@@ -38,14 +32,6 @@ group by
 	format(ti.[Дата создания задачи],'yyyy-MM')
 order by
 	1;
-
-
-
-
-
-
-
-
 
 
 set language russian;
@@ -77,5 +63,5 @@ from
 		and ActualRow=1
 	left join #sosh s
 		on c.SubdivisionId_SAFO_actual = s.subdivisionid
-	left join dbo.proba_dcc_tasks p
+	left join ##proba_dcc_tasks p
 		on ti.[Номер задачи] = p.task_id;
