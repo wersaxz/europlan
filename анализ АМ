@@ -360,4 +360,6 @@ from
     left join "tt_repeat"     r   on r."Номер проекта"   = pb."Номер проекта"
     left join "tt_segment"    sg  on sg."CtaRepositoryId" = pb."CtaRepositoryId"
     left join ds."DCC_Tasks_BA_Info" ba on ba."ProjectId" = pb."Номер проекта"
+where
+    coalesce(ba."Возвращен в КЦ"::text, '0') not in ('1','true','True')   -- без возвращённых в КЦ
 ;
