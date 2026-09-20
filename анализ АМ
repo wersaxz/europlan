@@ -158,9 +158,9 @@ select
      a."Номер проекта"
     ,a."Подразделение"
     ,case
-        when a."Подразделение" = 'Сектор прямых продаж ДКС' then 'Проект на МПП ДКС'
-        else 'Проект на другой функции'
-     end as "МПП"
+        when a."Подразделение" = 'Сектор прямых продаж ДКС' then 1
+        else 0
+     end as "МПП ДКС"
     ,case
         when o."department_name"    = 'Отдел по работе с клиентами ЛО (Рудыкин Д.)'      then 'ЦД Ленинградская область'
         when o."revenuecenter_name" != 'УРК МО' and o."division_name" = 'Дивизион Москва' then 'Москва'
@@ -224,14 +224,15 @@ analyze "tt_purchases";
 
 
 -- ============================================================================
--- 8. Целевой сегмент (AllPurchases."TargetSegment", булево)
---    берём последнее известное значение по контрагенту
+-- 8. Целевой сегмент клиента (AllPurchases."TargetSegment")
+--    ВНИМАНИЕ: известен только по клиентам, у которых есть покупки,
+--    у остальных приедет 'Нет данных'
 -- ============================================================================
 drop table if exists "tt_segment";
 create temp table "tt_segment" as
 select distinct on (ap."CtaRepositoryId")
      ap."CtaRepositoryId"
-    ,case when ap."TargetSegment" then 'Целевой' else 'Нецелевой' end as "Целевой сегмент"
+    ,case when ap."TargetSegment" then 1 else 0 end as "Целевой сегмент"
 from dwh."AllPurchases" ap
 where
         ap."CtaRepositoryId" in (select "CtaRepositoryId" from "tt_projects_base")
@@ -315,7 +316,7 @@ select
      ,m."ЦД"
      ,m."ЦП"
      ,m."Подразделение" as "Подразделение МОП"
-     ,m."МПП"
+     ,m."МПП ДКС"
 
      ,pb."Этап"
      ,pb."Статус"
