@@ -348,6 +348,7 @@ select
         when pu."Дата первой покупки в ЕП" <= (pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval)::date
         then 1 else 0
       end as "Покупка в ЕП 60 дней"
+     ,1 as "Проект"
 from
         "tt_projects_base" pb
     cross join "tt_params" p
