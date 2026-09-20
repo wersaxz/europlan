@@ -1,0 +1,361 @@
+-- ============================================================================
+-- Проекты исходящего канала ДКС с 23.06 по текущую дату
+-- Среда: PostgreSQL, без OPENQUERY
+-- 1 строка = 1 проект
+-- ============================================================================
+
+
+-- ============================================================================
+-- 0. ПАРАМЕТРЫ
+-- ============================================================================
+drop table if exists "tt_params";
+create temp table "tt_params" as
+select
+     date '2026-06-23' as "ДатаС"      -- включительно
+    ,current_date      as "ДатаПо"     -- включительно
+    ,60                as "Окно_дней"  -- окно вызревания передачи / покупки
+;
+
+
+-- ============================================================================
+-- 1. Все проекты, СОЗДАННЫЕ в периоде (отбор идёт по дате создания проекта,
+--    а не по дате итерации - иначе цепляются старые проекты, которых просто
+--    коснулся новый обзвон)
+-- ============================================================================
+drop table if exists "tt_projects_period";
+create temp table "tt_projects_period" as
+select
+     sp."Номер проекта"
+    ,sp."Дата создания проекта"
+    ,cast(date_trunc('month', sp."Дата создания проекта") as date) as "Месяц проекта"
+    ,sp."CtaRepositoryId"
+    ,sp."Этап"
+    ,sp."Статус"
+from
+        dwh."SAFO_Project" sp
+    cross join "tt_params" p
+where
+        sp."Дата создания проекта" >= p."ДатаС"
+    and sp."Дата создания проекта" <  p."ДатаПо" + interval '1 day'
+;
+create index on "tt_projects_period" ("Номер проекта");
+analyze "tt_projects_period";
+
+
+-- ============================================================================
+-- 2. Оставляем только проекты исходящего ДКС и вешаем МК
+--    МК = кампания ПЕРВОЙ итерации с project_id (без окна по датам),
+--    проект считается исходящим, если эта первая итерация из МК с type = 1
+--    Сортируем по li."ended": проект фиксируется к моменту завершения итерации
+-- ============================================================================
+drop table if exists "tt_dks_projects";
+create temp table "tt_dks_projects" as
+with a as (
+select distinct on (li.project_id)
+     li.project_id as "Номер проекта"
+    ,lc."name"     as "МК"
+    ,lc."type"     as "Тип МК"
+from
+        voipclient.leasing_interaction li
+    join voipclient.leasing_task t
+        on t.id = li.task
+    join voipclient.leasing_campaign lc
+        on lc.id = t.campaign
+where li.project_id in (select "Номер проекта" from "tt_projects_period")
+order by
+     li.project_id
+    ,li."ended" nulls last            -- незавершённые итерации не должны выигрывать
+)
+select
+     a."Номер проекта"
+    ,a."МК"
+from a
+where a."Тип МК" = 1                        -- исходящий канал
+;
+create index on "tt_dks_projects" ("Номер проекта");
+analyze "tt_dks_projects";
+
+
+-- ============================================================================
+-- 3. Карточка проекта
+-- ============================================================================
+drop table if exists "tt_projects_base";
+create temp table "tt_projects_base" as
+select
+     pp."Номер проекта"
+    ,pp."Дата создания проекта"
+    ,pp."Месяц проекта"
+    ,pp."CtaRepositoryId"
+    ,pp."Этап"
+    ,pp."Статус"
+    ,dp."МК"
+from
+        "tt_dks_projects" dp
+    join "tt_projects_period" pp
+        on pp."Номер проекта" = dp."Номер проекта"
+;
+create index on "tt_projects_base" ("Номер проекта");
+create index on "tt_projects_base" ("CtaRepositoryId");
+analyze "tt_projects_base";
+
+
+-- ============================================================================
+-- 4. Лог статусов: причина архива + предыдущий статус
+-- ============================================================================
+drop table if exists "tt_status_log";
+create temp table "tt_status_log" as
+select
+     psl."ProjectId" as "Номер проекта"
+    ,psl."CreatedAt"
+    ,ps."Name"       as "Статус лога"
+    ,rr."Name"       as "Причина архива"
+    ,row_number() over (partition by psl."ProjectId" order by psl."CreatedAt" desc) rn
+from
+        safo."Projects_StatusLog" psl
+    left join safo."Projects_Status" ps
+        on ps."id" = psl."StatusId"
+    left join safo."Projects_RejectionReason" rr
+        on rr."id" = psl."RejectionReasonId"
+where psl."ProjectId" in (select "Номер проекта" from "tt_projects_base")
+;
+create index on "tt_status_log" ("Номер проекта", rn);
+analyze "tt_status_log";
+
+
+-- ============================================================================
+-- 5. Последний МОП в проектной команде -> подразделение / ЦД / ЦП / дивизион
+-- ============================================================================
+drop table if exists "tt_mop_pre";
+create temp table "tt_mop_pre" as
+select distinct on (tcl."ProjectId")
+     tcl."ProjectId" as "Номер проекта"
+    ,c."Подразделение"
+    ,c."SubdivisionId_SAFO_actual"
+from
+        dwh."SAFO_Projects_TeamChangeLog" tcl
+    join dwh."Сотрудники" c
+        on c."UserID_SAFO" = tcl."UserId"
+       and c."ActualRow" = 1
+where
+        tcl."RoleId" = 6
+    and tcl."ProjectId" in (select "Номер проекта" from "tt_projects_base")
+order by
+     tcl."ProjectId"
+    ,tcl."DateFrom" desc
+;
+analyze "tt_mop_pre";
+
+drop table if exists "tt_org";
+create temp table "tt_org" as
+select * from ds."FT_SAFO_Org_Structure_History"(null, current_date)
+;
+create index on "tt_org" ("subdivisionid");
+analyze "tt_org";
+
+drop table if exists "tt_mop";
+create temp table "tt_mop" as
+select
+     a."Номер проекта"
+    ,a."Подразделение"
+    ,case
+        when a."Подразделение" = 'Сектор прямых продаж ДКС' then 'Проект на МПП ДКС'
+        else 'Проект на другой функции'
+     end as "МПП"
+    ,case
+        when o."department_name"    = 'Отдел по работе с клиентами ЛО (Рудыкин Д.)'      then 'ЦД Ленинградская область'
+        when o."revenuecenter_name" != 'УРК МО' and o."division_name" = 'Дивизион Москва' then 'Москва'
+        when o."revenuecenter_name"  = 'УРК МО' and o."division_name" = 'Дивизион Москва' then 'Московская область'
+        else o."profitcenter_name"
+     end as "ЦД"
+    ,case
+        when o."revenuecenter_name" != 'УРК МО' and o."division_name" = 'Дивизион Москва' then 'Москва'
+        when o."revenuecenter_name"  = 'УРК МО' and o."division_name" = 'Дивизион Москва' then 'Московская область'
+        else o."revenuecenter_name"
+     end as "ЦП"
+    ,o."division_name" as "Дивизион"
+from
+        "tt_mop_pre" a
+    left join "tt_org" o
+        on o."subdivisionid" = a."SubdivisionId_SAFO_actual"
+;
+create index on "tt_mop" ("Номер проекта");
+analyze "tt_mop";
+
+
+-- ============================================================================
+-- 6. Передачи по проекту
+-- ============================================================================
+drop table if exists "tt_transfer";
+create temp table "tt_transfer" as
+select
+     dl."ProjectId"               as "Номер проекта"
+    ,min(dl."ДатаПередачи")::date as "Первая дата передачи"
+    ,sum(dl."ЧИ")                 as "ЧИ проекта"
+from dwh."IC_ДоговорЛизинга" dl
+where
+        dl."ProjectId" in (select "Номер проекта" from "tt_projects_base")
+    and dl."ДатаПередачи" is not null
+group by dl."ProjectId"
+;
+create index on "tt_transfer" ("Номер проекта");
+analyze "tt_transfer";
+
+
+-- ============================================================================
+-- 7. Покупки ТС (ЕП / рынок) от даты создания проекта
+-- ============================================================================
+drop table if exists "tt_purchases";
+create temp table "tt_purchases" as
+select
+     pb."Номер проекта"
+    ,min(case when ap."Источник" = 'ЕП'   then ap."ДатаПокупки" end)::date as "Дата первой покупки в ЕП"
+    ,min(case when ap."Источник" = 'ЕФРС' then ap."ДатаПокупки" end)::date as "Дата первой покупки НЕ в ЕП"
+from
+        "tt_projects_base" pb
+    join dwh."AllPurchases" ap
+        on ap."CtaRepositoryId" = pb."CtaRepositoryId"
+       and ap."IsPurchase" is true
+       and ap."Источник" in ('ЕП', 'ЕФРС')
+       and ap."ДатаПокупки" >= pb."Дата создания проекта"
+group by pb."Номер проекта"
+;
+create index on "tt_purchases" ("Номер проекта");
+analyze "tt_purchases";
+
+
+-- ============================================================================
+-- 8. Целевой сегмент (AllPurchases."TargetSegment", булево)
+--    берём последнее известное значение по контрагенту
+-- ============================================================================
+drop table if exists "tt_segment";
+create temp table "tt_segment" as
+select distinct on (ap."CtaRepositoryId")
+     ap."CtaRepositoryId"
+    ,case when ap."TargetSegment" then 'Целевой' else 'Нецелевой' end as "Целевой сегмент"
+from dwh."AllPurchases" ap
+where
+        ap."CtaRepositoryId" in (select "CtaRepositoryId" from "tt_projects_base")
+    and ap."TargetSegment" is not null
+order by
+     ap."CtaRepositoryId"
+    ,ap."ДатаПокупки" desc
+;
+create index on "tt_segment" ("CtaRepositoryId");
+analyze "tt_segment";
+
+
+-- ============================================================================
+-- 9. Повторность клиента по ГК
+-- ============================================================================
+drop table if exists "tt_gbo_ids";
+create temp table "tt_gbo_ids" as
+select distinct coalesce(cc."GroupByOwnerId", -cc."CtaRepositoryId") as gbo_id
+from dwh."Cta_Counteragents" cc
+where cc."CtaRepositoryId" in (select "CtaRepositoryId" from "tt_projects_base")
+;
+analyze "tt_gbo_ids";
+
+drop table if exists "tt_gbo_all";
+create temp table "tt_gbo_all" as
+select distinct
+     cc."CtaRepositoryId"
+    ,coalesce(cc."GroupByOwnerId", -cc."CtaRepositoryId") as gbo_id
+from dwh."Cta_Counteragents" cc
+where coalesce(cc."GroupByOwnerId", -cc."CtaRepositoryId") in (select gbo_id from "tt_gbo_ids")
+;
+create index on "tt_gbo_all" ("CtaRepositoryId");
+analyze "tt_gbo_all";
+
+drop table if exists "tt_gbo_first";
+create temp table "tt_gbo_first" as
+select
+     g.gbo_id
+    ,min(dl."ДатаПередачи")::date as "Первая передача по ГК"
+from
+        "tt_gbo_all" g
+    join dwh."IC_ДоговорЛизинга" dl
+        on dl."CtaRepositoryId" = g."CtaRepositoryId"
+where dl."ДатаПередачи" is not null
+group by g.gbo_id
+;
+analyze "tt_gbo_first";
+
+drop table if exists "tt_repeat";
+create temp table "tt_repeat" as
+select distinct
+     pb."Номер проекта"
+    ,case
+        when gf."Первая передача по ГК" is null                      then 0
+        when gf."Первая передача по ГК" < pb."Дата создания проекта" then 1
+        else 0
+     end as "Повторный клиент"
+from
+        "tt_projects_base" pb
+    left join "tt_gbo_all" ga
+        on ga."CtaRepositoryId" = pb."CtaRepositoryId"
+    left join "tt_gbo_first" gf
+        on gf.gbo_id = ga.gbo_id
+;
+create index on "tt_repeat" ("Номер проекта");
+analyze "tt_repeat";
+
+
+-- ============================================================================
+-- 10. ИТОГОВАЯ ВЫГРУЗКА
+-- ============================================================================
+select
+      pb."Номер проекта"
+     ,pb."Дата создания проекта"
+     ,pb."Месяц проекта"
+     ,pb."МК"
+     ,sg."Целевой сегмент"
+     ,r."Повторный клиент"
+
+     ,m."Дивизион"
+     ,m."ЦД"
+     ,m."ЦП"
+     ,m."Подразделение" as "Подразделение МОП"
+     ,m."МПП"
+
+     ,pb."Этап"
+     ,pb."Статус"
+     ,sl2."Статус лога" as "Предыдущий статус"
+     ,sl1."Причина архива"
+     ,case
+        when sl1."Причина архива" = 'Отправлен в архив системой по истечении максимального срока бездействия по проекту'
+        then 1 else 0
+      end as "Автоархив"
+     ,case when ba."Был статус Требует согласования"::text in ('1','true','True') then 1 else 0 end as "Требует согласования"
+     ,case when ba."Назначена встреча"::text              in ('1','true','True') then 1 else 0 end as "Назначена встреча"
+
+     ,tr."Первая дата передачи"
+     ,case
+        when tr."Первая дата передачи" <= (pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval)::date
+        then 1 else 0
+      end as "Передача 60 дней"
+     ,tr."ЧИ проекта"
+     ,pu."Дата первой покупки в ЕП"
+     ,pu."Дата первой покупки НЕ в ЕП"
+     ,case
+        when least(
+               coalesce(pu."Дата первой покупки в ЕП",    date '9999-12-31')
+              ,coalesce(pu."Дата первой покупки НЕ в ЕП", date '9999-12-31')
+             ) <= (pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval)::date
+        then 1 else 0
+      end as "Покупка где-либо 60 дней"
+     ,case
+        when pu."Дата первой покупки в ЕП" <= (pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval)::date
+        then 1 else 0
+      end as "Покупка в ЕП 60 дней"
+from
+        "tt_projects_base" pb
+    cross join "tt_params" p
+    left join "tt_status_log" sl1 on sl1."Номер проекта" = pb."Номер проекта" and sl1.rn = 1
+    left join "tt_status_log" sl2 on sl2."Номер проекта" = pb."Номер проекта" and sl2.rn = 2
+    left join "tt_mop"        m   on m."Номер проекта"   = pb."Номер проекта"
+    left join "tt_transfer"   tr  on tr."Номер проекта"  = pb."Номер проекта"
+    left join "tt_purchases"  pu  on pu."Номер проекта"  = pb."Номер проекта"
+    left join "tt_repeat"     r   on r."Номер проекта"   = pb."Номер проекта"
+    left join "tt_segment"    sg  on sg."CtaRepositoryId" = pb."CtaRepositoryId"
+    left join ds."DCC_Tasks_BA_Info" ba on ba."ProjectId" = pb."Номер проекта"
+;
