@@ -1,0 +1,59 @@
+drop table if exists #purchases;
+
+select
+    sp.*,
+    iif(sp.[номер проекта] is null, 0, 1) as Был_прямой_проект,
+    iif(sp.[Класс закрывающего статуса] = 'Лизинг. Не удалось дозвониться', 0, 1) as Завершена_с_дозвоном,
+    cte1.[ЕП] as Покупок_в_ЕП_всего,
+    cte1.[не ЕП] as Покупок_НЕ_в_ЕП_всего,
+    iif(cte1.[ЕП] > 1, 1, 0) as [Факт покупки в ЕП в теч 60 дней],
+    iif(cte1.[не ЕП] > 1, 1, 0) as [Факт покупки НЕ в ЕП в теч 60 дней ЕФРС],
+    cte1.[Дата первой покупки в ЕП],
+    cte1.[Дата первой покупки не в ЕП],
+    iif([Был статус требует согласования] = 1 and [номер проекта] is not null, 1, 0) as [Получено согласование],
+    iif((cte1.[ЕП] > 0 or cte1.[не ЕП] > 0) and [номер проекта] is not null, 1, 0) as [Факт перехвата потребности],
+    iif((cte1.[ЕП] > 0 or cte1.[не ЕП] > 0) and [номер проекта] is null, 1, 0) as [Факт НЕперехвата потребности],
+	iif((cte1.[ЕП] > 0 or cte1.[не ЕП] > 0) and ([номер проекта] is not null or [Был статус требует согласования] = 1), 1, 0) as [Факт перехвата потребности c учетом согласования],
+    iif((cte1.[ЕП] > 0 or cte1.[не ЕП] > 0) and ([номер проекта] is null and [Был статус требует согласования] = 0), 1, 0) as [Факт НЕперехвата потребности с учетом согласования],
+    iif((cte1.[ЕП] > 0 or cte1.[не ЕП] > 0) and sp.[Класс закрывающего статуса] != 'Лизинг. Не удалось дозвониться', 1, 0) as [Факт Покупки на рынке в завершенных с дозвоном задачах],
+    ls.Статус as СтатусСотрудника,
+    iif(ls.Статус = 'Уволен', 1, 0) as Признак_Уволенного,
+    1 as odin
+from
+    report.dcc_ba_tasks_info sp
+left join (
+    select
+        sp.[Номер задачи],
+        COUNT(IIF(ap.Источник = 'ЕП', 1, null)) as [ЕП],
+        COUNT(IIF(ap.Источник != 'ЕП', 1, null)) as [не ЕП],
+        MIN(iif(ap.Источник = 'ЕП', ap.ДатаПокупки, null)) as [Дата первой покупки в ЕП],
+        MIN(iif(ap.Источник != 'ЕП', ap.ДатаПокупки, null)) as [Дата первой покупки не в ЕП]
+    from
+        report.dcc_ba_tasks_info sp
+    join [WarehousePG].[dwh_AllPurchases] ap
+        on sp.BranchId = ap.BranchId
+        and ap.IsPurchase = 1
+        and ap.Источник in ('ЕП', 'ЕФРС')
+        and ap.ДатаПокупки between sp.[Дата завершения задачи] and dateadd(dd, 60, sp.[Дата завершения задачи])
+    group by
+        sp.[Номер задачи]
+) as cte1
+    on sp.[Номер задачи] = cte1.[Номер задачи]
+left join (
+    select Логин, Статус
+    from (
+        select *,
+            ROW_NUMBER() over (
+                partition by Логин
+                order by DateFrom desc
+            ) as rn
+        from WarehousePG.dwh_Сотрудники
+        where Статус is not null
+    ) as ranked
+    where rn = 1
+) as ls
+    on sp.[Логин оператора] = ls.Логин
+where
+    sp.[Дата завершения задачи] between DATEADD(MONTH, -12, GETDATE()) and GETDATE()
+	and [ФИО оперератора] not LIKE '%Автодозвон%'
+	and Канал = 'Исходящие'
