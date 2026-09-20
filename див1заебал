@@ -46,6 +46,10 @@ from
 
 select
 	ti.*
+	,cast(ti.[Дата создания задачи] as date)   [Дата создания день]
+	,cast(ti.[Дата завершения задачи] as date) [Дата завершения день]
+	,datefromparts(year(ti.[Дата создания задачи]),   month(ti.[Дата создания задачи]),   1) [Месяц создания]
+	,datefromparts(year(ti.[Дата завершения задачи]), month(ti.[Дата завершения задачи]), 1) [Месяц завершения]
 	,iif([Класс закрывающего статуса] = 'Лизинг. Не удалось дозвониться',0,1) Завершена_с_дозвоном
 	,1 as odin
 	,lt.payload_type
@@ -63,5 +67,7 @@ from
 		and ActualRow=1
 	left join #sosh s
 		on c.SubdivisionId_SAFO_actual = s.subdivisionid
+	left join ##proba_dcc_tasks p
+		on ti.[Номер задачи] = p.task_id;
 	left join ##proba_dcc_tasks p
 		on ti.[Номер задачи] = p.task_id;
