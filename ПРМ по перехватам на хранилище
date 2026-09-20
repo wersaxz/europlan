@@ -1,0 +1,78 @@
+select
+sp."TaskId" as "Номер задачи",
+sp."TaskCreatedAt"::date as "Дата создания задачи",
+sp."InteractionEnded"::date as "Дата завершения задачи",
+(sp."InteractionEnded"::date-sp."TaskCreatedAt"::date)::integer as "Дней от создания до закрытия задачи",
+sp."TaskCampaignName" as "МК",
+sp."TaskChannelName" as "Канал",
+sp."TaskRequiresApprove"::integer as "Был статус требует согласования",
+sp."InteractionStatusTitle" as "Закрывающий статус",
+sp."InteractionClassDescription" as "Класс закрывающего статуса",
+sp."OperatorGroupName" as "Группа оператора",
+sp."OperatorLogin" as "Логин оператора",
+sp."ProjectId" as "Номер проекта",
+ls."ФИО оперератора",
+    sp.*,
+    (CASE WHEN sp."ProjectId" IS NULL THEN 0 ELSE 1 end)::INTEGER AS "Был_прямой_проект",
+    (CASE WHEN sp."InteractionClassDescription" = 'Лизинг. Не удалось дозвониться' THEN 0 ELSE 1 end)::INTEGER AS "Завершена_с_дозвоном",
+    cte1."ЕП" AS "Покупок_в_ЕП_всего",
+    cte1."не ЕП" AS "Покупок_НЕ_в_ЕП_всего",
+    (CASE WHEN cte1."ЕП" > 1 THEN 1 ELSE 0 end)::INTEGER  AS "Факт покупки в ЕП в теч 60 дней",
+    (CASE WHEN cte1."не ЕП" > 1 THEN 1 ELSE 0 end)::INTEGER  AS "Факт покупки НЕ в ЕП в теч 60 дней ЕФРС",
+    cte1."Дата первой покупки в ЕП"::date,
+    cte1."Дата первой покупки не в ЕП"::date,
+    (CASE WHEN sp."TaskRequiresApprove" = 1 AND sp."ProjectId" IS NOT NULL THEN 1 ELSE 0 end)::integer AS "Получено согласование",
+    (CASE WHEN (cte1."ЕП" > 0 OR cte1."не ЕП" > 0) AND sp."ProjectId" IS NOT NULL THEN 1 ELSE 0 end)::integer AS "Факт перехвата потребности",
+    (CASE WHEN (cte1."ЕП" > 0 OR cte1."не ЕП" > 0) AND sp."ProjectId" IS NULL THEN 1 ELSE 0 end)::integer AS "Факт НЕперехвата потребности",
+    (CASE WHEN (cte1."ЕП" > 0 OR cte1."не ЕП" > 0)
+          AND (sp."ProjectId" IS NOT NULL OR sp."TaskRequiresApprove" = 1)
+        THEN 1 ELSE 0 end)::integer AS "Факт перехвата потребности c учетом согласования",
+    (CASE WHEN (cte1."ЕП" > 0 OR cte1."не ЕП" > 0)
+          AND (sp."ProjectId" IS NULL AND sp."TaskRequiresApprove" = 0)
+        THEN 1 ELSE 0 end)::integer AS "Факт НЕперехвата потребности с учетом согласования",
+    (CASE WHEN (cte1."ЕП" > 0 OR cte1."не ЕП" > 0)
+          AND sp."InteractionClassDescription" != 'Лизинг. Не удалось дозвониться'
+        THEN 1 ELSE 0 end)::integer AS "Факт Покупки на рынке в завершенных с дозвоном задачах",
+    ls."Статус" AS "СтатусСотрудника",
+    (CASE WHEN ls."Статус" = 'Уволен' THEN 1 ELSE 0 end)::integer AS "Признак_Уволенного",
+    1 AS "odin"
+FROM
+    dwh."VoipClient_LeasingTask" sp
+    ----агрегаты покупок к задачам
+LEFT JOIN (
+    SELECT
+        sp."TaskId",
+        COUNT(CASE WHEN ap."Источник" = 'ЕП' THEN 1 END) AS "ЕП",
+        COUNT(CASE WHEN ap."Источник" != 'ЕП' THEN 1 END) AS "не ЕП",
+        MIN(CASE WHEN ap."Источник" = 'ЕП' THEN ap."ДатаПокупки" END) AS "Дата первой покупки в ЕП",
+        MIN(CASE WHEN ap."Источник" != 'ЕП' THEN ap."ДатаПокупки" END) AS "Дата первой покупки не в ЕП"
+    FROM
+        dwh."VoipClient_LeasingTask" sp
+    JOIN dwh."AllPurchases" ap
+        ON sp."BranchId" = ap."BranchId"
+       AND ap."IsPurchase" is true
+       AND ap."Источник" IN ('ЕП', 'ЕФРС')
+       AND ap."ДатаПокупки" BETWEEN sp."InteractionEnded"
+                                AND (sp."InteractionEnded" + INTERVAL '60 days')
+    GROUP BY
+        sp."TaskId"
+) AS cte1
+    ON sp."TaskId" = cte1."TaskId"
+LEFT JOIN (
+    SELECT "Логин", "Статус", concat("Фамилия",' ',"Имя",' ',"Отчество") as "ФИО оперератора"
+    FROM (
+        SELECT *,
+            ROW_NUMBER() OVER (
+                PARTITION BY "Логин"
+                ORDER BY "DateFrom" DESC
+            ) AS rn
+        FROM dwh."Сотрудники"
+        WHERE "Статус" IS NOT NULL
+    ) AS ranked
+    WHERE rn = 1
+) AS ls
+    ON sp."OperatorLogin" = ls."Логин"
+WHERE
+    sp."InteractionEnded" BETWEEN (NOW() - INTERVAL '12 months') AND NOW()
+  AND sp."OperatorLogin" NOT LIKE '%autocalls777%'
+  AND sp."TaskChannelName" = 'Исходящий'
