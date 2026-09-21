@@ -343,6 +343,11 @@ select
         when regexp_replace(sl1."Причина архива", '\s+', ' ', 'g') = 'Клиент или Поручитель в <черном> списке'
         then 1 else 0
       end as "Отказ СБ"
+     ,case
+        when sl1."Причина архива" = 'Отказ ОУР'
+          or regexp_replace(sl1."Причина архива", '\s+', ' ', 'g') = 'Клиент или Поручитель в <черном> списке'
+        then 1 else 0
+      end as "Отказ ОУР/СБ"
      ,case when ba."Был статус Требует согласования"::text in ('1','true','True') then 1 else 0 end as "Требует согласования"
      ,case when ba."Назначена встреча"::text              in ('1','true','True') then 1 else 0 end as "Назначена встреча"
 
