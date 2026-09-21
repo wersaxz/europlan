@@ -202,21 +202,23 @@ analyze "tt_transfer";
 
 
 -- ============================================================================
--- 7. Покупки ТС (ЕП / рынок) от даты создания проекта
+-- 7. Покупки ТС (ЕП / рынок) в окне 60 дней от даты создания проекта
 -- ============================================================================
 drop table if exists "tt_purchases";
 create temp table "tt_purchases" as
 select
      pb."Номер проекта"
-    ,min(case when ap."Источник" = 'ЕП'   then ap."ДатаПокупки" end)::date as "Дата первой покупки в ЕП"
-    ,min(case when ap."Источник" = 'ЕФРС' then ap."ДатаПокупки" end)::date as "Дата первой покупки НЕ в ЕП"
+    ,count(case when ap."Источник" = 'ЕП'   then ap."Key" end) as "Кол-во ТС в ЕП"
+    ,count(case when ap."Источник" = 'ЕФРС' then ap."Key" end) as "Кол-во ТС НЕ в ЕП"
 from
         "tt_projects_base" pb
+    cross join "tt_params" p
     join dwh."AllPurchases" ap
         on ap."CtaRepositoryId" = pb."CtaRepositoryId"
        and ap."IsPurchase" is true
        and ap."Источник" in ('ЕП', 'ЕФРС')
        and ap."ДатаПокупки" >= pb."Дата создания проекта"
+       and ap."ДатаПокупки" <  pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval
 group by pb."Номер проекта"
 ;
 create index on "tt_purchases" ("Номер проекта");
@@ -330,24 +332,13 @@ select
      ,case when ba."Назначена встреча"::text              in ('1','true','True') then 1 else 0 end as "Назначена встреча"
 
      ,tr."Первая дата передачи"
-     ,case
-        when tr."Первая дата передачи" <= (pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval)::date
-        then 1 else 0
-      end as "Передача 60 дней"
+     ,case when tr."Первая дата передачи" is not null then 1 else 0 end as "Передача"
      ,tr."ЧИ проекта"
-     ,pu."Дата первой покупки в ЕП"
-     ,pu."Дата первой покупки НЕ в ЕП"
-     ,case
-        when least(
-               coalesce(pu."Дата первой покупки в ЕП",    date '9999-12-31')
-              ,coalesce(pu."Дата первой покупки НЕ в ЕП", date '9999-12-31')
-             ) <= (pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval)::date
-        then 1 else 0
-      end as "Покупка где-либо 60 дней"
-     ,case
-        when pu."Дата первой покупки в ЕП" <= (pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval)::date
-        then 1 else 0
-      end as "Покупка в ЕП 60 дней"
+     ,coalesce(pu."Кол-во ТС в ЕП", 0)                                         as "Кол-во ТС в ЕП"
+     ,coalesce(pu."Кол-во ТС НЕ в ЕП", 0)                                      as "Кол-во ТС НЕ в ЕП"
+     ,coalesce(pu."Кол-во ТС в ЕП", 0) + coalesce(pu."Кол-во ТС НЕ в ЕП", 0)  as "Кол-во ТС на рынке"
+     ,case when coalesce(pu."Кол-во ТС в ЕП", 0) + coalesce(pu."Кол-во ТС НЕ в ЕП", 0) > 0 then 1 else 0 end as "Покупка где-либо 60 дней"
+     ,case when coalesce(pu."Кол-во ТС в ЕП", 0) > 0 then 1 else 0 end         as "Покупка в ЕП 60 дней"
      ,1 as "Проект"
 from
         "tt_projects_base" pb
