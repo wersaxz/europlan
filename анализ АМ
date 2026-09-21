@@ -13,7 +13,7 @@ create temp table "tt_params" as
 select
      date '2026-06-23' as "ДатаС"      -- включительно
     ,current_date      as "ДатаПо"     -- включительно
-    ,60                as "Окно_дней"  -- окно вызревания передачи / покупки
+    ,60                as "Окно_дней"  -- окно для качества (покупка в 60 дней)
 ;
 
 
@@ -192,13 +192,8 @@ select
     ,min(dl."ДатаПередачи")::date as "Первая дата передачи"
     ,sum(dl."ЧИ")                 as "ЧИ проекта"
     ,count(dl."ProjectId")        as "Кол-во переданных ДЛ"
-    ,count(case
-              when dl."ДатаПередачи" < pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval
-              then dl."ProjectId"
-           end)                   as "Кол-во переданных ДЛ 60 дней"
 from
         "tt_projects_base" pb
-    cross join "tt_params" p
     join dwh."IC_ДоговорЛизинга" dl
         on dl."ProjectId" = pb."Номер проекта"
        and dl."ДатаПередачи" is not null
@@ -209,7 +204,9 @@ analyze "tt_transfer";
 
 
 -- ============================================================================
--- 7. Покупки ТС (ЕП / рынок) в окне 60 дней от даты создания проекта
+-- 7. Покупки ТС (ЕП / рынок) от даты создания проекта
+--    Кол-во ТС - без ограничения срока
+--    Флаг покупки (для качества проектов) - в окне 60 дней
 -- ============================================================================
 drop table if exists "tt_purchases";
 create temp table "tt_purchases" as
@@ -217,6 +214,10 @@ select
      pb."Номер проекта"
     ,count(case when ap."Источник" = 'ЕП'   then ap."Key" end) as "Кол-во ТС в ЕП"
     ,count(case when ap."Источник" = 'ЕФРС' then ap."Key" end) as "Кол-во ТС НЕ в ЕП"
+    ,max(case
+            when ap."ДатаПокупки" < pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval
+            then 1 else 0
+         end)                                                   as "Покупка где-либо 60 дней"
 from
         "tt_projects_base" pb
     cross join "tt_params" p
@@ -225,7 +226,6 @@ from
        and ap."IsPurchase" is true
        and ap."Источник" in ('ЕП', 'ЕФРС')
        and ap."ДатаПокупки" >= pb."Дата создания проекта"
-       and ap."ДатаПокупки" <  pb."Дата создания проекта" + (p."Окно_дней" || ' days')::interval
 group by pb."Номер проекта"
 ;
 create index on "tt_purchases" ("Номер проекта");
@@ -234,8 +234,7 @@ analyze "tt_purchases";
 
 -- ============================================================================
 -- 8. Целевой сегмент клиента (AllPurchases."TargetSegment")
---    ВНИМАНИЕ: известен только по клиентам, у которых есть покупки,
---    у остальных приедет 'Нет данных'
+--    известен только по клиентам с покупками, у остальных пусто
 -- ============================================================================
 drop table if exists "tt_segment";
 create temp table "tt_segment" as
@@ -341,17 +340,14 @@ select
      ,tr."Первая дата передачи"
      ,case when tr."Первая дата передачи" is not null then 1 else 0 end as "Передача"
      ,coalesce(tr."Кол-во переданных ДЛ", 0)         as "Кол-во переданных ДЛ"
-     ,coalesce(tr."Кол-во переданных ДЛ 60 дней", 0) as "Кол-во переданных ДЛ 60 дней"
      ,tr."ЧИ проекта"
      ,coalesce(pu."Кол-во ТС в ЕП", 0)                                         as "Кол-во ТС в ЕП"
      ,coalesce(pu."Кол-во ТС НЕ в ЕП", 0)                                      as "Кол-во ТС НЕ в ЕП"
      ,coalesce(pu."Кол-во ТС в ЕП", 0) + coalesce(pu."Кол-во ТС НЕ в ЕП", 0)  as "Кол-во ТС на рынке"
-     ,case when coalesce(pu."Кол-во ТС в ЕП", 0) + coalesce(pu."Кол-во ТС НЕ в ЕП", 0) > 0 then 1 else 0 end as "Покупка где-либо 60 дней"
-     ,case when coalesce(pu."Кол-во ТС в ЕП", 0) > 0 then 1 else 0 end         as "Покупка в ЕП 60 дней"
+     ,coalesce(pu."Покупка где-либо 60 дней", 0)                                as "Покупка где-либо 60 дней"
      ,1 as "Проект"
 from
         "tt_projects_base" pb
-    cross join "tt_params" p
     left join "tt_status_log" sl1 on sl1."Номер проекта" = pb."Номер проекта" and sl1.rn = 1
     left join "tt_status_log" sl2 on sl2."Номер проекта" = pb."Номер проекта" and sl2.rn = 2
     left join "tt_mop"        m   on m."Номер проекта"   = pb."Номер проекта"
