@@ -129,6 +129,7 @@ drop table if exists "tt_mop_pre";
 create temp table "tt_mop_pre" as
 select distinct on (tcl."ProjectId")
      tcl."ProjectId" as "Номер проекта"
+    ,c."Сотрудник"
     ,c."Подразделение"
     ,c."SubdivisionId_SAFO_actual"
 from
@@ -156,6 +157,7 @@ drop table if exists "tt_mop";
 create temp table "tt_mop" as
 select
      a."Номер проекта"
+    ,a."Сотрудник"
     ,a."Подразделение"
     ,case
         when a."Подразделение" = 'Сектор прямых продаж ДКС' then 1
@@ -324,6 +326,7 @@ select
      ,sg."Целевой сегмент"
      ,r."Повторный клиент"
 
+     ,m."Сотрудник" as "МОП"
      ,m."Дивизион"
      ,m."ЦД"
      ,m."ЦП"
