@@ -5,20 +5,20 @@ declare @date_to      date = dateadd(day, 1, cast(getdate() as date));
 declare @min_talk_sec int  = 120;
 declare @purch_months int  = 36;
 
--- 1. Задачи из отчёта: исходящие, нужные статусы, закрыты за последние 3 месяца
+-- 1. Задачи из отчёта: исходящие, нужные статусы, завершены за последние 3 месяца
 if object_id('tempdb..#tasks') is not null drop table #tasks;
 
 select
      r.[Номер задачи]                 as task_id
-    ,r.[Дата закрытия задачи]         as end_dt        -- ⚠ проверить имя поля
+    ,r.[Дата завершения задачи]       as end_dt
     ,r.[МК]                           as mk
     ,r.[Закрывающий статус]           as status_name   -- ⚠ проверить имя поля
 into #tasks
 from Report.dcc_ba_tasks_info r
 where r.[Канал] = N'Исходящие'
   and r.[Закрывающий статус] in (N'Клиент думает', N'Неудобно разговаривать', N'Сброс звонка')   -- ⚠
-  and r.[Дата закрытия задачи] >= @date_from                                                    -- ⚠
-  and r.[Дата закрытия задачи] <  @date_to;                                                     -- ⚠
+  and r.[Дата завершения задачи] >= @date_from
+  and r.[Дата завершения задачи] <  @date_to;
 
 -- 2. Последняя итерация по задаче (та, где проставлен закрывающий статус)
 if object_id('tempdb..#last_iter') is not null drop table #last_iter;
@@ -31,7 +31,7 @@ from (
         ,i.started
         ,i.ended
         ,row_number() over (partition by i.task order by i.ended desc, i.id desc) as rn
-    from WarehousePG.voipclient_leasing_interaction i              -- ⚠ имя таблицы
+    from WarehousePG.voipclient_leasing_interaction i
     where i.task in (select task_id from #tasks)
       and i.ended is not null
 ) x
@@ -46,7 +46,7 @@ select
 from #tasks t
 join #last_iter li
     on li.task = t.task_id
-join WarehousePG.voipclient_leasing_task lt                        -- ⚠ имя таблицы
+join WarehousePG.voipclient_leasing_task lt
     on lt.id = t.task_id
 where datediff(second, li.started, li.ended) >= @min_talk_sec
   and exists (
