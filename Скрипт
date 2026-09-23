@@ -1,0 +1,94 @@
+-- Упущенная выгода: исходящий канал ДКС, закрывающие статусы
+-- "Думает" / "Неудобно разговаривать" / "Сброс звонка", покупающие клиенты
+with params as (
+    select
+         (current_date - interval '3 months')::date                          as date_from   -- 3 месяца назад, включительно
+        ,(current_date + 1)                                                  as date_to     -- до конца сегодняшнего дня
+        ,array['Думает', 'Неудобно разговаривать', 'Сброс звонка']::text[]   as statuses
+        ,interval '12 months'                                                as win_short
+        ,1                                                                   as min_purch_short
+        ,interval '24 months'                                                as win_long
+        ,4                                                                   as min_purch_long
+),
+-- 1. Задачи исходящего канала, у которых есть итерация, завершённая в периоде, и нет открытых итераций
+tasks as (
+    select
+         t.id
+        ,t.cta_repository_id
+        ,lc.name as campaign_name
+    from voipclient.leasing_task t
+    join voipclient.leasing_campaign lc
+        on lc.id = t.campaign
+       and lc.type = 1                                   -- исходящий канал
+    cross join params p
+    where exists (
+            select 1
+            from voipclient.leasing_interaction i
+            where i.task = t.id
+              and i.ended >= p.date_from
+              and i.ended <  p.date_to
+          )
+      and not exists (
+            select 1
+            from voipclient.leasing_interaction i
+            where i.task = t.id
+              and i.ended is null
+          )
+),
+-- 2. Последняя итерация по задаче (по моменту завершения)
+last_iter as (
+    select distinct on (i.task)
+         i.task
+        ,i.ended
+        ,i.status
+    from voipclient.leasing_interaction i
+    join tasks t
+        on t.id = i.task
+    where i.ended is not null
+    order by i.task, i.ended desc, i.id desc
+),
+-- 3. Отбор по периоду и закрывающему статусу
+filtered as (
+    select
+         t.id                    as task
+        ,t.cta_repository_id
+        ,t.campaign_name
+        ,li.ended                as end_dt
+        ,cs.name                 as status_name          -- ⚠ проверить имя поля названия статуса
+    from last_iter li
+    join tasks t
+        on t.id = li.task
+    join voipclient.configuration_status cs
+        on cs.id = li.status
+    cross join params p
+    where li.ended >= p.date_from
+      and li.ended <  p.date_to
+      and cs.name = any(p.statuses)                      -- ⚠
+),
+-- 4. Покупки клиента в окне до даты завершения задачи
+purch as (
+    select
+         f.task
+        ,count(*) filter (where ap."ДатаПокупки" >= (f.end_dt - p.win_short)::date) as n_short
+        ,count(*)                                                                  as n_long
+    from filtered f
+    cross join params p
+    join dwh."AllPurchases" ap
+        on ap."CtaRepositoryId" = f.cta_repository_id
+       and ap."ДатаПокупки" <  f.end_dt::date
+       and ap."ДатаПокупки" >= (f.end_dt - p.win_long)::date
+       and ap."ActualRow"::int = 1
+    group by f.task
+)
+select
+     f.task           as "Номер задачи"
+    ,f.end_dt         as "Дата завершения задачи"
+    ,f.campaign_name  as "МК"
+    ,f.status_name    as "Статус"
+from filtered f
+join purch pr
+    on pr.task = f.task
+cross join params p
+where pr.n_short >= p.min_purch_short
+   or pr.n_long  >= p.min_purch_long
+order by f.end_dt desc;
