@@ -1,90 +1,60 @@
--- Упущенная выгода: исходящий канал ДКС, закрывающие статусы, покупающие клиенты
+-- Упущенная выгода: исходящий канал ДКС, закрывающие статусы, разговор от 2 минут, покупающие клиенты
 
--- 0. Параметры
-drop table if exists tt_params;
-create temp table tt_params as
+declare @date_from    date = dateadd(month, -3, cast(getdate() as date));
+declare @date_to      date = dateadd(day, 1, cast(getdate() as date));
+declare @min_talk_sec int  = 120;
+declare @purch_months int  = 36;
+
+-- 1. Задачи из отчёта: исходящие, нужные статусы, закрыты за последние 3 месяца
+if object_id('tempdb..#tasks') is not null drop table #tasks;
+
 select
-     (current_date - interval '3 months')::date                                   as date_from
-    ,(current_date + 1)::date                                                     as date_to
-    ,array['Клиент думает', 'Неудобно разговаривать', 'Сброс звонка']::text[]     as statuses
-;
+     r.[Номер задачи]                 as task_id
+    ,r.[Дата закрытия задачи]         as end_dt        -- ⚠ проверить имя поля
+    ,r.[МК]                           as mk
+    ,r.[Закрывающий статус]           as status_name   -- ⚠ проверить имя поля
+into #tasks
+from Report.dcc_ba_tasks_info r
+where r.[Канал] = N'Исходящие'
+  and r.[Закрывающий статус] in (N'Клиент думает', N'Неудобно разговаривать', N'Сброс звонка')   -- ⚠
+  and r.[Дата закрытия задачи] >= @date_from                                                    -- ⚠
+  and r.[Дата закрытия задачи] <  @date_to;                                                     -- ⚠
 
--- 1. id нужных статусов (маленький справочник)
-drop table if exists tt_status;
-create temp table tt_status as
-select cs.id, cs.name
-from voipclient.configuration_status cs
-cross join tt_params p
-where cs.name = any(p.statuses)
-;
+-- 2. Последняя итерация по задаче (та, где проставлен закрывающий статус)
+if object_id('tempdb..#last_iter') is not null drop table #last_iter;
 
--- 2. Итерации в периоде с нужным статусом, только исходящий канал
-drop table if exists tt_cand;
-create temp table tt_cand as
+select task, started, ended
+into #last_iter
+from (
+    select
+         i.task
+        ,i.started
+        ,i.ended
+        ,row_number() over (partition by i.task order by i.ended desc, i.id desc) as rn
+    from WarehousePG.voipclient_leasing_interaction i              -- ⚠ имя таблицы
+    where i.task in (select task_id from #tasks)
+      and i.ended is not null
+) x
+where rn = 1;
+
+-- 3. Итог
 select
-     i.task
-    ,i.id          as interaction_id
-    ,i.ended
-    ,s.name        as status_name
-    ,lc.name       as campaign_name
-    ,t.cta_repository_id
-from voipclient.leasing_interaction i
-join tt_status s
-    on s.id = i.status
-join voipclient.leasing_task t
-    on t.id = i.task
-join voipclient.leasing_campaign lc
-    on lc.id = t.campaign
-   and lc.type = 1
-cross join tt_params p
-where i.ended >= p.date_from
-  and i.ended <  p.date_to
-;
-
--- 3. Оставляем только если это последняя итерация задачи и задача закрыта
-drop table if exists tt_tasks;
-create temp table tt_tasks as
-select distinct on (c.task)
-     c.task
-    ,c.ended
-    ,c.status_name
-    ,c.campaign_name
-    ,c.cta_repository_id
-from tt_cand c
-where not exists (
+     t.task_id      as [Номер задачи]
+    ,t.end_dt       as [Дата завершения задачи]
+    ,t.mk           as [МК]
+    ,t.status_name  as [Статус]
+from #tasks t
+join #last_iter li
+    on li.task = t.task_id
+join WarehousePG.voipclient_leasing_task lt                        -- ⚠ имя таблицы
+    on lt.id = t.task_id
+where datediff(second, li.started, li.ended) >= @min_talk_sec
+  and exists (
         select 1
-        from voipclient.leasing_interaction i
-        where i.task = c.task
-          and (i.ended is null or i.ended > c.ended)
+        from WarehousePG.dwh_AllPurchases ap
+        where ap.CtaRepositoryId = lt.cta_repository_id
+          and ap.ActualRow = 1
+          and ap.[ДатаПокупки] <  cast(t.end_dt as date)
+          and ap.[ДатаПокупки] >= dateadd(month, -@purch_months, cast(t.end_dt as date))
       )
-order by c.task, c.ended desc, c.interaction_id desc
-;
-
--- 4. Покупки только по клиентам из списка, окно 24 мес. до самой ранней даты завершения
-drop table if exists tt_purch;
-create temp table tt_purch as
-select
-     ap."CtaRepositoryId"   as cta_id
-    ,ap."ДатаПокупки"       as purch_date
-from dwh."AllPurchases" ap
-where ap."ActualRow"::int = 1
-  and ap."CtaRepositoryId" in (select distinct cta_repository_id from tt_tasks)
-  and ap."ДатаПокупки" >= (select min(ended)::date - interval '24 months' from tt_tasks)
-;
-
--- 5. Итог: ≥1 покупки за 12 мес. ИЛИ ≥4 покупок за 24 мес. до завершения задачи
-select
-     t.task            as "Номер задачи"
-    ,t.ended           as "Дата завершения задачи"
-    ,t.campaign_name   as "МК"
-    ,t.status_name     as "Статус"
-from tt_tasks t
-join tt_purch pu
-    on pu.cta_id = t.cta_repository_id
-   and pu.purch_date <  t.ended::date
-   and pu.purch_date >= (t.ended - interval '24 months')::date
-group by t.task, t.ended, t.campaign_name, t.status_name
-having count(*) filter (where pu.purch_date >= (t.ended - interval '12 months')::date) >= 1
-    or count(*) >= 4
-order by t.ended desc
-;
+order by t.end_dt desc;
