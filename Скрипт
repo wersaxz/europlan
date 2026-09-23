@@ -16,47 +16,8 @@ select
     ,r.[Дата завершения задачи]       as end_dt
     ,r.[МК]                           as mk
     ,r.[Закрывающий статус]           as status_name   -- ⚠ проверить имя поля
+    ,r.[Группа оператора]             as op_group
 into #tasks
 from Report.dcc_ba_tasks_info r
 where r.[Канал] = N'Исходящие'
-  and r.[Закрывающий статус] in (N'Клиент думает', N'Неудобно разговаривать', N'Сброс звонка')   -- ⚠
-  and r.[Дата завершения задачи] >= @date_from
-  and r.[Дата завершения задачи] <  @date_to;
-
--- 2. Последняя итерация по задаче (та, где проставлен закрывающий статус) + длина разговора
-select task, datediff(second, started, ended) as talk_sec
-into #last_iter
-from (
-    select
-         i.task
-        ,i.started
-        ,i.ended
-        ,row_number() over (partition by i.task order by i.ended desc, i.id desc) as rn
-    from WarehousePG.voipclient_leasing_interaction i
-    where i.task in (select task_id from #tasks)
-      and i.ended is not null
-) x
-where rn = 1;
-
--- 3. Итог
-select
-     t.task_id                                              as [Номер задачи]
-    ,t.end_dt                                               as [Дата завершения задачи]
-    ,t.mk                                                   as [МК]
-    ,t.status_name                                          as [Статус]
-    ,cast(dateadd(second, li.talk_sec, 0) as time(0))       as [Длина разговора]
-from #tasks t
-join #last_iter li
-    on li.task = t.task_id
-join WarehousePG.voipclient_leasing_task lt
-    on lt.id = t.task_id
-where li.talk_sec >= @min_talk_sec
-  and exists (
-        select 1
-        from WarehousePG.dwh_AllPurchases ap
-        where ap.CtaRepositoryId = lt.cta_repository_id
-          and ap.ActualRow = 1
-          and ap.[ДатаПокупки] <  cast(t.end_dt as date)
-          and ap.[ДатаПокупки] >= dateadd(month, -@purch_months, cast(t.end_dt as date))
-      )
-order by t.end_dt desc;
+  and r.[Закрывающий
