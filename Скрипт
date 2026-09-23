@@ -2,7 +2,7 @@ with params as (
     select
          dateadd(month, -3, cast(getdate() as date))   as date_from
         ,dateadd(day, 1, cast(getdate() as date))      as date_to
-        ,120                                           as min_talk_sec
+        ,0                                             as min_talk_sec   -- без ограничения по длине
         ,36                                            as purch_months
 ),
 tasks as (
