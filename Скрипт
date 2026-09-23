@@ -1,13 +1,16 @@
 -- Упущенная выгода: исходящий канал ДКС, закрывающие статусы, разговор от 2 минут, покупающие клиенты
 
+-- 0. Чистим временные таблицы отдельным пакетом
+if object_id('tempdb..#tasks')     is not null drop table #tasks;
+if object_id('tempdb..#last_iter') is not null drop table #last_iter;
+GO
+
 declare @date_from    date = dateadd(month, -3, cast(getdate() as date));
 declare @date_to      date = dateadd(day, 1, cast(getdate() as date));
 declare @min_talk_sec int  = 120;
 declare @purch_months int  = 36;
 
 -- 1. Задачи из отчёта: исходящие, нужные статусы, завершены за последние 3 месяца
-if object_id('tempdb..#tasks') is not null drop table #tasks;
-
 select
      r.[Номер задачи]                 as task_id
     ,r.[Дата завершения задачи]       as end_dt
@@ -21,8 +24,6 @@ where r.[Канал] = N'Исходящие'
   and r.[Дата завершения задачи] <  @date_to;
 
 -- 2. Последняя итерация по задаче (та, где проставлен закрывающий статус) + длина разговора
-if object_id('tempdb..#last_iter') is not null drop table #last_iter;
-
 select task, datediff(second, started, ended) as talk_sec
 into #last_iter
 from (
