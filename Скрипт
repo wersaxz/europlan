@@ -1,94 +1,90 @@
--- Упущенная выгода: исходящий канал ДКС, закрывающие статусы
--- "Думает" / "Неудобно разговаривать" / "Сброс звонка", покупающие клиенты
-with params as (
-    select
-         (current_date - interval '3 months')::date                          as date_from   -- 3 месяца назад, включительно
-        ,(current_date + 1)                                                  as date_to     -- до конца сегодняшнего дня
-        ,array['Думает', 'Неудобно разговаривать', 'Сброс звонка']::text[]   as statuses
-        ,interval '12 months'                                                as win_short
-        ,1                                                                   as min_purch_short
-        ,interval '24 months'                                                as win_long
-        ,4                                                                   as min_purch_long
-),
--- 1. Задачи исходящего канала, у которых есть итерация, завершённая в периоде, и нет открытых итераций
-tasks as (
-    select
-         t.id
-        ,t.cta_repository_id
-        ,lc.name as campaign_name
-    from voipclient.leasing_task t
-    join voipclient.leasing_campaign lc
-        on lc.id = t.campaign
-       and lc.type = 1                                   -- исходящий канал
-    cross join params p
-    where exists (
-            select 1
-            from voipclient.leasing_interaction i
-            where i.task = t.id
-              and i.ended >= p.date_from
-              and i.ended <  p.date_to
-          )
-      and not exists (
-            select 1
-            from voipclient.leasing_interaction i
-            where i.task = t.id
-              and i.ended is null
-          )
-),
--- 2. Последняя итерация по задаче (по моменту завершения)
-last_iter as (
-    select distinct on (i.task)
-         i.task
-        ,i.ended
-        ,i.status
-    from voipclient.leasing_interaction i
-    join tasks t
-        on t.id = i.task
-    where i.ended is not null
-    order by i.task, i.ended desc, i.id desc
-),
--- 3. Отбор по периоду и закрывающему статусу
-filtered as (
-    select
-         t.id                    as task
-        ,t.cta_repository_id
-        ,t.campaign_name
-        ,li.ended                as end_dt
-        ,cs.name                 as status_name          -- ⚠ проверить имя поля названия статуса
-    from last_iter li
-    join tasks t
-        on t.id = li.task
-    join voipclient.configuration_status cs
-        on cs.id = li.status
-    cross join params p
-    where li.ended >= p.date_from
-      and li.ended <  p.date_to
-      and cs.name = any(p.statuses)                      -- ⚠
-),
--- 4. Покупки клиента в окне до даты завершения задачи
-purch as (
-    select
-         f.task
-        ,count(*) filter (where ap."ДатаПокупки" >= (f.end_dt - p.win_short)::date) as n_short
-        ,count(*)                                                                  as n_long
-    from filtered f
-    cross join params p
-    join dwh."AllPurchases" ap
-        on ap."CtaRepositoryId" = f.cta_repository_id
-       and ap."ДатаПокупки" <  f.end_dt::date
-       and ap."ДатаПокупки" >= (f.end_dt - p.win_long)::date
-       and ap."ActualRow"::int = 1
-    group by f.task
-)
+-- Упущенная выгода: исходящий канал ДКС, закрывающие статусы, покупающие клиенты
+
+-- 0. Параметры
+drop table if exists tt_params;
+create temp table tt_params as
 select
-     f.task           as "Номер задачи"
-    ,f.end_dt         as "Дата завершения задачи"
-    ,f.campaign_name  as "МК"
-    ,f.status_name    as "Статус"
-from filtered f
-join purch pr
-    on pr.task = f.task
-cross join params p
-where pr.n_short >= p.min_purch_short
-   or pr.n_long  >= p.min_purch_long
-order by f.end_dt desc;
+     (current_date - interval '3 months')::date                                   as date_from
+    ,(current_date + 1)::date                                                     as date_to
+    ,array['Клиент думает', 'Неудобно разговаривать', 'Сброс звонка']::text[]     as statuses
+;
+
+-- 1. id нужных статусов (маленький справочник)
+drop table if exists tt_status;
+create temp table tt_status as
+select cs.id, cs.name
+from voipclient.configuration_status cs
+cross join tt_params p
+where cs.name = any(p.statuses)
+;
+
+-- 2. Итерации в периоде с нужным статусом, только исходящий канал
+drop table if exists tt_cand;
+create temp table tt_cand as
+select
+     i.task
+    ,i.id          as interaction_id
+    ,i.ended
+    ,s.name        as status_name
+    ,lc.name       as campaign_name
+    ,t.cta_repository_id
+from voipclient.leasing_interaction i
+join tt_status s
+    on s.id = i.status
+join voipclient.leasing_task t
+    on t.id = i.task
+join voipclient.leasing_campaign lc
+    on lc.id = t.campaign
+   and lc.type = 1
+cross join tt_params p
+where i.ended >= p.date_from
+  and i.ended <  p.date_to
+;
+
+-- 3. Оставляем только если это последняя итерация задачи и задача закрыта
+drop table if exists tt_tasks;
+create temp table tt_tasks as
+select distinct on (c.task)
+     c.task
+    ,c.ended
+    ,c.status_name
+    ,c.campaign_name
+    ,c.cta_repository_id
+from tt_cand c
+where not exists (
+        select 1
+        from voipclient.leasing_interaction i
+        where i.task = c.task
+          and (i.ended is null or i.ended > c.ended)
+      )
+order by c.task, c.ended desc, c.interaction_id desc
+;
+
+-- 4. Покупки только по клиентам из списка, окно 24 мес. до самой ранней даты завершения
+drop table if exists tt_purch;
+create temp table tt_purch as
+select
+     ap."CtaRepositoryId"   as cta_id
+    ,ap."ДатаПокупки"       as purch_date
+from dwh."AllPurchases" ap
+where ap."ActualRow"::int = 1
+  and ap."CtaRepositoryId" in (select distinct cta_repository_id from tt_tasks)
+  and ap."ДатаПокупки" >= (select min(ended)::date - interval '24 months' from tt_tasks)
+;
+
+-- 5. Итог: ≥1 покупки за 12 мес. ИЛИ ≥4 покупок за 24 мес. до завершения задачи
+select
+     t.task            as "Номер задачи"
+    ,t.ended           as "Дата завершения задачи"
+    ,t.campaign_name   as "МК"
+    ,t.status_name     as "Статус"
+from tt_tasks t
+join tt_purch pu
+    on pu.cta_id = t.cta_repository_id
+   and pu.purch_date <  t.ended::date
+   and pu.purch_date >= (t.ended - interval '24 months')::date
+group by t.task, t.ended, t.campaign_name, t.status_name
+having count(*) filter (where pu.purch_date >= (t.ended - interval '12 months')::date) >= 1
+    or count(*) >= 4
+order by t.ended desc
+;
