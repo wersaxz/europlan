@@ -1,0 +1,141 @@
+-- ============ ПАРАМЕТРЫ ============
+drop table if exists tt_params;
+create temp table tt_params as
+select date '2026-04-01' as dt_from
+      ,date '2026-10-01' as dt_to;      -- верхняя граница НЕ включается
+
+-- ============ 1. Орг-структура (функция тяжёлая, материализуем один раз) ============
+drop table if exists tt_sosh;
+create temp table tt_sosh as
+select * from ds."FT_SAFO_Org_Structure_History"(null, current_date);
+create index on tt_sosh ("subdivisionid");
+
+-- ============ 2. ЦП по МОП ============
+drop table if exists tt_cp_mop;
+create temp table tt_cp_mop as
+select distinct
+     c."UserID_SAFO" as user_id
+    ,case
+        when s."revenuecenter_name" != 'УРК МО' and s."division_name" = 'Дивизион Москва' then 'Москва'
+        when s."revenuecenter_name"  = 'УРК МО' and s."division_name" = 'Дивизион Москва' then 'Московская область'
+        else s."revenuecenter_name"
+     end            as "ЦП МОП"
+from dwh."Сотрудники" c
+    join tt_sosh s on s."subdivisionid" = c."SubdivisionId_SAFO_actual"
+where c."ActualRow" = 1;
+
+create index on tt_cp_mop (user_id);
+
+-- ============ 3. Задачи исходящего канала ============
+drop table if exists tt_tasks;
+create temp table tt_tasks as
+select
+     t.id                as task_id
+    ,t.created_at
+    ,t.payload_type
+    ,t.branch_id
+    ,t.cta_repository_id
+    ,lc."name"           as campaign_name
+from voipclient.leasing_task t
+    join voipclient.leasing_campaign lc
+        on t.campaign = lc.id
+       and lc."type" = 1
+    cross join tt_params p
+where t.created_at >= p.dt_from - interval '6 months'
+  and t.created_at <  p.dt_to;
+
+create index on tt_tasks (task_id);
+
+-- ============ 4. Последняя итерация: дозвон и дата завершения ============
+drop table if exists tt_last;
+create temp table tt_last as
+select distinct on (i.task)
+     i.task     as task_id
+    ,i.started
+    ,i.ended
+    ,i."operator"
+    ,cc."name"  as class_name
+from voipclient.leasing_interaction i
+    join tt_tasks t on t.task_id = i.task
+    left join voipclient.configuration_status cs on i.status = cs.id
+    left join voipclient.configuration_class  cc on cs."class" = cc.id
+where i.ended is not null
+order by i.task, i.ended desc;
+
+create index on tt_last (task_id);
+
+-- ============ 5. Проект по задаче ============
+drop table if exists tt_proj;
+create temp table tt_proj as
+select
+     i.task                                           as task_id
+    ,max(case when cs."class" = 34 then 1 else 0 end) as was_project
+    ,min(i.project_id)                                as project_id
+from voipclient.leasing_interaction i
+    join tt_tasks t on t.task_id = i.task
+    left join voipclient.configuration_status cs on i.status = cs.id
+group by i.task;
+
+create index on tt_proj (task_id);
+
+-- ============ 6. Оператор ДКС ============
+drop table if exists tt_oper;
+create temp table tt_oper as
+select
+     l.task_id
+    ,op.login
+    ,concat_ws(' ', op.last_name, op.second_name, op.first_name) as fio
+    ,sotr."Подразделение"
+from tt_last l
+    left join voipclient.configuration_operator op
+        on l."operator" = op.id
+    left join dwh."Сотрудники" sotr
+        on sotr."Логин" = op.login
+       and l.started > sotr."DateFrom"
+       and l.started < sotr."DateTo";
+
+create index on tt_oper (task_id);
+
+-- ============ 7. Выгрузка ============
+select
+     t.task_id                                   as "Номер задачи"
+    ,t.created_at                                as "Дата создания задачи"
+    ,l.ended                                     as "Дата завершения задачи"
+    ,date_trunc('month', t.created_at)::date     as "Месяц создания"
+    ,date_trunc('month', l.ended)::date          as "Месяц завершения"
+    ,t.campaign_name                             as "МК"
+    ,t.payload_type
+    ,b."Дивизион по контрагенту"
+    ,b."ЦД по контрагенту"
+    ,b."Дивизион по МОП"
+    ,b."ЦД МОП"
+    ,cp."ЦП МОП"
+    ,b."Площадка"
+    ,b."Возвращен в КЦ"
+    ,b."Повторный"
+    ,b."Повторный по ГК"
+    ,b."Была активная связь на дату создания задачи"
+    ,b."Был статус Требует согласования"
+    ,b."Назначена встреча"
+    ,b."Была передача по прямому"
+    ,b."Была передача по всем"
+    ,b."ЧИ по всем"
+    ,case when l.class_name = 'leasing.call_failed' then 0 else 1 end as "Завершена с дозвоном"
+    ,coalesce(pr.was_project, 0)                 as "был_создан_проект"
+    ,pr.project_id                               as "Номер проекта"
+    ,1                                           as "один"
+    ,o.login                                     as "Логин оператора"
+    ,o.fio                                       as "ФИО оператора"
+    ,pb."Вероятность по модели"
+from tt_tasks t
+    join tt_last l on l.task_id = t.task_id
+    cross join tt_params p
+    left join tt_proj pr on pr.task_id = t.task_id
+    left join tt_oper o  on o.task_id  = t.task_id
+    left join ds."DCC_Tasks_BA_Info" b on b."TaskId" = t.task_id
+    left join tt_cp_mop cp on cp.user_id = b."NewUserId"
+    left join ds."DCC_Tasks_Today_Proba" pb
+        on pb."Номер задачи" = t.task_id
+where l.ended >= p.dt_from
+  and l.ended <  p.dt_to
+order by t.task_id;
