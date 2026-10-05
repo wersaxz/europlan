@@ -1,12 +1,12 @@
 -- ============ ПАРАМЕТРЫ ============
-drop table if exists tt_params;
-create temp table tt_params as
+drop table if exists pg_temp.tt_dz_params;
+create temp table tt_dz_params as
 select date '2026-01-01' as dt_from
       ,date '2027-01-01' as dt_to;      -- верхняя граница НЕ включается
 
 -- ============ 1. Задачи исходящего канала ============
-drop table if exists tt_tasks;
-create temp table tt_tasks as
+drop table if exists pg_temp.tt_dz_tasks;
+create temp table tt_dz_tasks as
 select
      t.id       as task_id
     ,t.created_at
@@ -16,55 +16,55 @@ from voipclient.leasing_task t
     join voipclient.leasing_campaign lc
         on t.campaign = lc.id
        and lc."type" = 1
-    cross join tt_params p
+    cross join tt_dz_params p
 where t.created_at >= p.dt_from - interval '6 months'
   and t.created_at <  p.dt_to;
 
-create index on tt_tasks (task_id);
+create index on tt_dz_tasks (task_id);
 
 -- ============ 2. Последняя итерация: дозвон и дата завершения ============
-drop table if exists tt_last;
-create temp table tt_last as
+drop table if exists pg_temp.tt_dz_last;
+create temp table tt_dz_last as
 select distinct on (i.task)
      i.task     as task_id
     ,i.ended
     ,cc."name"  as class_name
 from voipclient.leasing_interaction i
-    join tt_tasks t on t.task_id = i.task
+    join tt_dz_tasks t on t.task_id = i.task
     left join voipclient.configuration_status cs on i.status = cs.id
     left join voipclient.configuration_class  cc on cs."class" = cc.id
 where i.ended is not null
 order by i.task, i.ended desc;
 
-create index on tt_last (task_id);
+create index on tt_dz_last (task_id);
 
 -- ============ 3. База для анализа ============
-drop table if exists tt_base;
-create temp table tt_base as
+drop table if exists pg_temp.tt_dz_base;
+create temp table tt_dz_base as
 select
      t.task_id
-    ,date_trunc('month', l.ended)::date   as "Месяц"
-    ,coalesce(b."Дивизион по МОП", 'Не определён') as "Дивизион МОП"
-    ,coalesce(b."ЦД МОП", 'Не определён')          as "ЦД МОП"
-    ,t.campaign_name                       as "МК"
+    ,date_trunc('month', l.ended)::date             as "Месяц"
+    ,coalesce(b."Дивизион по МОП", 'Не определён')  as "Дивизион МОП"
+    ,coalesce(b."ЦД МОП", 'Не определён')           as "ЦД МОП"
+    ,t.campaign_name                                as "МК"
     ,case when l.class_name = 'leasing.call_failed' then 0 else 1 end as dozvon
-from tt_tasks t
-    join tt_last l on l.task_id = t.task_id
-    cross join tt_params p
+from tt_dz_tasks t
+    join tt_dz_last l on l.task_id = t.task_id
+    cross join tt_dz_params p
     left join ds."DCC_Tasks_BA_Info" b on b."TaskId" = t.task_id
 where l.ended >= p.dt_from
   and l.ended <  p.dt_to;
 
-create index on tt_base ("Дивизион МОП", "Месяц");
+create index on tt_dz_base ("Дивизион МОП", "Месяц");
 
 -- ============ 4. Дозвон по дивизионам МОП, помесячно ============
 select
      "Дивизион МОП"
     ,"Месяц"
-    ,count(*)                                              as "Задач"
-    ,sum(dozvon)                                           as "С дозвоном"
-    ,round(100.0 * sum(dozvon) / count(*), 2)              as "% дозвона"
-from tt_base
+    ,count(*)                                 as "Задач"
+    ,sum(dozvon)                              as "С дозвоном"
+    ,round(100.0 * sum(dozvon) / count(*), 2) as "% дозвона"
+from tt_dz_base
 group by "Дивизион МОП", "Месяц"
 order by "Дивизион МОП", "Месяц";
 
@@ -76,7 +76,7 @@ select
     ,count(*)                                 as "Задач"
     ,sum(dozvon)                              as "С дозвоном"
     ,round(100.0 * sum(dozvon) / count(*), 2) as "% дозвона"
-from tt_base
+from tt_dz_base
 group by "Дивизион МОП", "ЦД МОП", "Месяц"
 order by "Дивизион МОП", "ЦД МОП", "Месяц";
 
@@ -86,6 +86,6 @@ select
     ,count(*)                                 as "Задач"
     ,sum(dozvon)                              as "С дозвоном"
     ,round(100.0 * sum(dozvon) / count(*), 2) as "% дозвона"
-from tt_base
+from tt_dz_base
 group by "Месяц"
 order by "Месяц";
