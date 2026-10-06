@@ -1,54 +1,141 @@
-drop table if exists #atr;
-select distinct
-iif([Исходный проект ДКС] is null,[Номер проекта],[Исходный проект ДКС]) as [Номер проекта с учетом передач по перезаведенным]
-,iif([Исходный проект ДКС] is null,[Дата проекта],[Дата исходного проекта]) [Дата исходного проекта]
-,min([Дата передачи проекта]) as [Дата передачи проекта]
-,count([Id ДФЛ]) as [Кол-во ТС в проекте]
-,sum(ЧИИсходящие) as ЧИИсходящие
-,1 as [Передача атрибуция]
-into #atr
-from
-Report.Daily_ProjectMarketingCommunicationAttribution
-where [Дата передачи проекта] between '2025-01-01' and getdate()
-and ДатаПередачиДФЛ is not null
-group by 
-iif([Исходный проект ДКС] is null,[Номер проекта],[Исходный проект ДКС]) 
-,iif([Исходный проект ДКС] is null,[Дата проекта],[Дата исходного проекта]) 
-
---and [Номер проекта]=3623453
---and iif([Исходный проект ДКС] is null,[Номер проекта],[Исходный проект ДКС])=3623453
-
-
-
---drop table if exists #final;
+--================================================================
+-- Параметры: период отчёта
+--================================================================
+drop table if exists tt_params;
+create temp table tt_params as
 select
-	ti.[Номер задачи]
-	,ti.[Номер проекта]
-	,ti.[Дата создания задачи]
-	,ti.[Дата завершения задачи]
-	,ti.МК
-	,ti.Канал
-	,ti.[Класс закрывающего статуса]
-	,ti.[Возвращен в КЦ]
-	,ti.[Была передача по всем]
-	,ti.[ТС передано по всем]
-	,ti.[ЧИ по всем]
-	,ti.[Площадка]
-	,ЧИИсходящие
-	,iif([номер проекта] is null,0,1) Был_прямой_проект
-	,iif([Класс закрывающего статуса] = 'Лизинг. Не удалось дозвониться',0,1) Завершена_с_дозвоном
-	,1 as odin 
-	,[Передача атрибуция]
-	,[Дата исходного проекта]
-	,[Дата передачи проекта]
-	,[Кол-во ТС в проекте]
---into #final
-from 
-	report.dcc_ba_tasks_info ti
-	join WarehousePG.voipclient_leasing_task lt
-		on ti.[Номер задачи]=lt.id
-		and ti.[Дата завершения задачи] between '2025-01-01' and getdate()
-		and ti.[Класс закрывающего статуса] <> 'Лизинг. Не удалось дозвониться'
-		and lt.payload_type!='partners'
-		and ti.Канал = 'Исходящие'
-	left join #atr atr on atr.[Номер проекта с учетом передач по перезаведенным]=ti.[Номер проекта]
+	 timestamp '2025-01-01' as date_from
+	,now()::timestamp       as date_to
+;
+
+--================================================================
+-- Атрибуция: материализуем функцию один раз (тяжёлая)
+--================================================================
+drop table if exists tt_atr_src;
+create temp table tt_atr_src as
+select *
+from ds."FT_Daily_Project_Marketing_Communication_Attribution"()
+;
+
+--================================================================
+-- atr: передачи с учётом перезаведённых проектов (аналог #atr)
+--================================================================
+drop table if exists atr;
+create temp table atr as
+select
+	 coalesce(a."Исходный проект ДКС", a."Номер проекта") as "Номер проекта с учетом передач по перезаведенным"
+	,case when a."Исходный проект ДКС" is null
+	      then a."Дата проекта"
+	      else a."Дата исходного проекта"
+	 end                          as "Дата исходного проекта"
+	,min(a."Дата передачи проекта") as "Дата передачи проекта"
+	,count(a."Id ДФЛ")              as "Кол-во ТС в проекте"
+	,sum(a."ЧИИсходящие")           as "ЧИИсходящие"
+	,1                              as "Передача атрибуция"
+from
+	tt_atr_src a
+	cross join tt_params p
+where
+	a."Дата передачи проекта" between p.date_from and p.date_to
+	and a."ДатаПередачиДФЛ" is not null
+group by
+	 coalesce(a."Исходный проект ДКС", a."Номер проекта")
+	,case when a."Исходный проект ДКС" is null
+	      then a."Дата проекта"
+	      else a."Дата исходного проекта"
+	 end
+;
+
+--================================================================
+-- Задачи исходящего канала без поставщиков + МК
+--================================================================
+drop table if exists tt_tasks;
+create temp table tt_tasks as
+select
+	 ti."TaskId"                as "Номер задачи"
+	,ti."ProjectId"             as "Номер проекта"
+	,ti."TaskCreatedAt"         as "Дата создания задачи"
+	,lc."name"                  as "МК"
+	,ti."Канал"
+	,ti."Возвращен в КЦ"
+	,ti."Была передача по всем"
+	,ti."ТС передано по всем"
+	,ti."ЧИ по всем"
+	,ti."Площадка"
+	,ti."Дивизион по МОП"
+from
+	ds."DCC_Tasks_BA_Info" ti
+	join voipclient.leasing_task lt
+		on lt.id = ti."TaskId"
+	left join voipclient.leasing_campaign lc
+		on lc.id = lt.campaign
+where
+	ti."Канал" = 'Исходящие'
+	and lt.payload_type != 'partners'
+;
+
+--================================================================
+-- Закрывающая итерация задачи: дата завершения и класс статуса
+-- (последняя по ended; NULL отсекаем по тому же полю)
+--================================================================
+drop table if exists tt_close;
+create temp table tt_close as
+select distinct on (li.task)
+	 li.task
+	,li.ended   as "Дата завершения задачи"
+	,cc."name"  as "Класс закрывающего статуса"
+from
+	voipclient.leasing_interaction li
+	left join voipclient.configuration_status cs
+		on cs.id = li.status
+	left join voipclient.configuration_class cc
+		on cc.id = cs."class"
+where
+	li.ended is not null
+	and exists (select 1 from tt_tasks t where t."Номер задачи" = li.task)
+order by
+	 li.task
+	,li.ended desc
+	,li.id desc
+;
+
+--================================================================
+-- Итог (аналог финального select / #final)
+--================================================================
+drop table if exists final;
+create temp table final as
+select
+	 t."Номер задачи"
+	,t."Номер проекта"
+	,t."Дата создания задачи"
+	,c."Дата завершения задачи"
+	,t."МК"
+	,t."Канал"
+	,c."Класс закрывающего статуса"
+	,t."Возвращен в КЦ"
+	,t."Была передача по всем"
+	,t."ТС передано по всем"
+	,t."ЧИ по всем"
+	,t."Площадка"
+	,t."Дивизион по МОП"
+	,atr."ЧИИсходящие"
+	,case when t."Номер проекта" is null then 0 else 1 end as "Был_прямой_проект"
+	,case when c."Класс закрывающего статуса" = 'leasing.call_failed' then 0 else 1 end as "Завершена_с_дозвоном"
+	,1 as "odin"
+	,atr."Передача атрибуция"
+	,atr."Дата исходного проекта"
+	,atr."Дата передачи проекта"
+	,atr."Кол-во ТС в проекте"
+from
+	tt_tasks t
+	join tt_close c
+		on c.task = t."Номер задачи"
+	cross join tt_params p
+	left join atr
+		on atr."Номер проекта с учетом передач по перезаведенным" = t."Номер проекта"
+where
+	c."Дата завершения задачи" between p.date_from and p.date_to
+	and c."Класс закрывающего статуса" <> 'leasing.call_failed'
+;
+
+select * from final;
