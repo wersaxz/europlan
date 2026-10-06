@@ -98,8 +98,9 @@ drop table if exists tt_close;
 create temp table tt_close as
 select distinct on (li.task)
 	 li.task
-	,li.ended   as "Дата завершения задачи"
-	,cc."name"  as "Класс закрывающего статуса"
+	,li.ended          as "Дата завершения задачи"
+	,cc."name"         as class_code                      -- технический код, для фильтров
+	,cc."description"  as "Класс закрывающего статуса"    -- русское название из справочника
 from
 	voipclient.leasing_interaction li
 	join tt_tasks t
@@ -137,7 +138,7 @@ select
 	,t."Дивизион по МОП"
 	,atr."ЧИИсходящие"
 	,case when t."Номер проекта" is null then 0 else 1 end as "Был_прямой_проект"
-	,case when c."Класс закрывающего статуса" = 'leasing.call_failed' then 0 else 1 end as "Завершена_с_дозвоном"
+	,case when c.class_code = 'leasing.call_failed' then 0 else 1 end as "Завершена_с_дозвоном"
 	,1 as "odin"
 	,atr."Передача атрибуция"
 	,atr."Дата исходного проекта"
@@ -152,7 +153,7 @@ from
 		on atr."Номер проекта с учетом передач по перезаведенным" = t."Номер проекта"
 where
 	c."Дата завершения задачи" between p.date_from and p.date_to
-	and c."Класс закрывающего статуса" <> 'leasing.call_failed'
+	and c.class_code <> 'leasing.call_failed'
 ;
 
 select * from final;
