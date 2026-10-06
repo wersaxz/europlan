@@ -1,11 +1,12 @@
 --================================================================
--- Параметры: период отчёта
+-- Параметры: период отчёта и исключаемые проекты (выбросы)
 --================================================================
 drop table if exists tt_params;
 create temp table tt_params as
 select
-	 timestamp '2025-01-01' as date_from
-	,now()::timestamp       as date_to
+	 timestamp '2025-01-01'      as date_from
+	,now()::timestamp            as date_to
+	,array[4313419]::bigint[]    as excluded_projects
 ;
 
 --================================================================
@@ -38,6 +39,7 @@ from
 where
 	a."Дата передачи проекта" between p.date_from and p.date_to
 	and a."ДатаПередачиДФЛ" is not null
+	and coalesce(a."Исходный проект ДКС", a."Номер проекта") <> all (p.excluded_projects)
 group by
 	 coalesce(a."Исходный проект ДКС", a."Номер проекта")
 	,case when a."Исходный проект ДКС" is null
@@ -48,7 +50,8 @@ group by
 
 --================================================================
 -- Задачи исходящего канала без поставщиков + МК
--- (только задачи с итерацией, завершённой с начала периода)
+-- (только задачи с итерацией, завершённой с начала периода;
+--  без исключаемых проектов)
 --================================================================
 drop table if exists tt_tasks;
 create temp table tt_tasks as
@@ -74,6 +77,8 @@ from
 where
 	ti."Канал" = 'Исходящий звонок'
 	and lt.payload_type != 'partners'
+	-- задачи без проекта остаются, убираем только выбросы
+	and (ti."ProjectId" is null or ti."ProjectId" <> all (p.excluded_projects))
 	and exists (
 		select 1
 		from voipclient.leasing_interaction li
