@@ -48,6 +48,7 @@ group by
 
 --================================================================
 -- Задачи исходящего канала без поставщиков + МК
+-- (только задачи с итерацией, завершённой с начала периода)
 --================================================================
 drop table if exists tt_tasks;
 create temp table tt_tasks as
@@ -56,7 +57,7 @@ select
 	,ti."ProjectId"             as "Номер проекта"
 	,ti."TaskCreatedAt"         as "Дата создания задачи"
 	,lc."name"                  as "МК"
-	,ti."Канал"
+	,'Исходящие'::text          as "Канал"   -- в витрине: 'Исходящий звонок'
 	,ti."Возвращен в КЦ"
 	,ti."Была передача по всем"
 	,ti."ТС передано по всем"
@@ -65,14 +66,24 @@ select
 	,ti."Дивизион по МОП"
 from
 	ds."DCC_Tasks_BA_Info" ti
+	cross join tt_params p
 	join voipclient.leasing_task lt
 		on lt.id = ti."TaskId"
 	left join voipclient.leasing_campaign lc
 		on lc.id = lt.campaign
 where
-	ti."Канал" = 'Исходящие'
+	ti."Канал" = 'Исходящий звонок'
 	and lt.payload_type != 'partners'
+	and exists (
+		select 1
+		from voipclient.leasing_interaction li
+		where li.task = ti."TaskId"
+		  and li.ended >= p.date_from
+	)
 ;
+
+create index on tt_tasks ("Номер задачи");
+analyze tt_tasks;
 
 --================================================================
 -- Закрывающая итерация задачи: дата завершения и класс статуса
@@ -86,13 +97,14 @@ select distinct on (li.task)
 	,cc."name"  as "Класс закрывающего статуса"
 from
 	voipclient.leasing_interaction li
+	join tt_tasks t
+		on t."Номер задачи" = li.task
 	left join voipclient.configuration_status cs
 		on cs.id = li.status
 	left join voipclient.configuration_class cc
 		on cc.id = cs."class"
 where
 	li.ended is not null
-	and exists (select 1 from tt_tasks t where t."Номер задачи" = li.task)
 order by
 	 li.task
 	,li.ended desc
