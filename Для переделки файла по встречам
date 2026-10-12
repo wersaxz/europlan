@@ -1,0 +1,75 @@
+--================================================================
+-- 1. Справочник типов событий cwc
+--    Жду: точно ли 30 = встреча с МОП; нет ли других типов встреч
+--================================================================
+select * 
+from dwh."ContactsWithCounteragents_EventType" 
+order by "Id";
+
+
+--================================================================
+-- 2. Состав полей cwc
+--    Жду: есть ли BranchId, сотрудник, проект или что-то ещё полезное
+--================================================================
+select column_name, data_type
+from information_schema.columns
+where table_schema = 'dwh' 
+  and table_name   = 'ContactsWithCounteragents'
+order by ordinal_position;
+
+
+--================================================================
+-- 3. Объём встреч по месяцам
+--    Жду: данные живые весь период, без провалов
+--    (таблица тяжёлая, может идти 10–15 минут)
+--================================================================
+select 
+     date_trunc('month', event_datetime_utc + interval '3 hours')::date as "Месяц"
+    ,count(*)                          as "Встреч"
+    ,count(distinct "CtaRepositoryId") as "Контрагентов"
+from dwh."ContactsWithCounteragents"
+where event_type = 30
+  and event_datetime_utc >= '2025-01-01'
+group by 1
+order by 1;
+
+
+--================================================================
+-- 4. Что за этап StageId = 5
+--    Жду: статусы этого этапа относятся к ОУР
+--================================================================
+select s.id, s."Name", s."StageId"
+from safo."Projects_Status" s
+where s."StageId" = 5
+order by s.id;
+
+
+--================================================================
+-- 5. Состав полей витрины БА
+--    Жду: есть ли «Назначена встреча», «Канал», «Была передача по всем»,
+--    «Был статус Требует согласования», дата завершения задачи
+--================================================================
+select column_name, data_type
+from information_schema.columns
+where table_schema = 'ds' 
+  and table_name   = 'DCC_Tasks_BA_Info'
+order by ordinal_position;
+
+
+--================================================================
+-- 6. Насколько заполнен JSON meetingInfo в итерациях
+--    Жду: с какого месяца поле живое и какая доля проектов с ним
+--    (нужно для определения «встреча назначена»)
+--================================================================
+select 
+     date_trunc('month', started)::date as "Месяц"
+    ,count(distinct project_id) as "Проектов"
+    ,count(distinct project_id) filter (
+        where project_data #> '{content,meetingInfo}' is not null)                         as "С meetingInfo"
+    ,count(distinct project_id) filter (
+        where project_data #>> '{content,meetingInfo,reasonProjectWithoutMeet,text}' is not null) as "С причиной без встречи"
+from voipclient.leasing_interaction
+where started >= '2025-01-01'
+  and project_id is not null
+group by 1
+order by 1;
