@@ -1,0 +1,148 @@
+--================================================================
+-- Параметры
+--================================================================
+drop table if exists tt_params;
+create temp table tt_params as
+select
+     21                 as kp_days      -- порог фильтра КП, дней
+    ,'2025-01-01'::date as date_from    -- начало периода звонков
+;
+
+--================================================================
+-- 1. Эпизоды заморозки: звонки со статусами переноса и planned > звонок + 21 день
+--================================================================
+drop table if exists tt_episodes;
+create temp table tt_episodes as
+select
+     li.id                                              as interaction_id
+    ,li.task
+    ,coalesce(li.cta_repository_id, t.cta_repository_id) as cta
+    ,cs.name                                            as status_name
+    ,li.started
+    ,li.planned
+    ,li.planned - make_interval(days => p.kp_days)      as kp_release_dt
+from voipclient.leasing_interaction li
+join voipclient.configuration_status cs
+    on cs.id = li.status
+join voipclient.leasing_task t
+    on t.id = li.task
+cross join tt_params p
+where cs.name in ('leasing.planned_later', 'leasing.not_planning_until')
+  and coalesce(t.payload_type, '') <> 'partners'
+  and li.started >= p.date_from
+  and li.planned > li.started + make_interval(days => p.kp_days)
+  and coalesce(li.cta_repository_id, t.cta_repository_id) is not null
+;
+
+create index on tt_episodes (cta);
+analyze tt_episodes;
+
+--================================================================
+-- 2. Следующее взаимодействие ДКС с тем же клиентом (перекрывает заморозку)
+--================================================================
+drop table if exists tt_cli_inter;
+create temp table tt_cli_inter as
+select
+     x.interaction_id
+    ,x.cta
+    ,x.started
+    ,lead(x.started) over (partition by x.cta order by x.started, x.interaction_id) as next_started
+from (
+    select
+         li.id                                              as interaction_id
+        ,coalesce(li.cta_repository_id, t.cta_repository_id) as cta
+        ,li.started
+    from voipclient.leasing_interaction li
+    join voipclient.leasing_task t
+        on t.id = li.task
+    cross join tt_params p
+    where coalesce(t.payload_type, '') <> 'partners'
+      and li.started >= p.date_from
+      and li.started is not null
+      and coalesce(li.cta_repository_id, t.cta_repository_id) in (select cta from tt_episodes)
+) x
+;
+
+--================================================================
+-- 3. Окно заморозки
+--================================================================
+drop table if exists tt_episodes2;
+create temp table tt_episodes2 as
+select
+     e.*
+    ,ci.next_started
+    ,least(e.kp_release_dt, coalesce(ci.next_started, 'infinity'), now()) as freeze_end
+    ,case
+        when ci.next_started is not null
+         and ci.next_started < least(e.kp_release_dt, now()) then 'Новый контакт ДКС'
+        when e.kp_release_dt <= now()                        then 'Отпущен фильтром КП'
+        else 'Заморожен до сих пор'
+     end as end_reason
+from tt_episodes e
+left join tt_cli_inter ci
+    on ci.interaction_id = e.interaction_id
+;
+
+delete from tt_episodes2 where freeze_end <= started;
+analyze tt_episodes2;
+
+--================================================================
+-- 4. Рыночные покупки внутри окна заморозки
+--================================================================
+drop table if exists tt_loss;
+create temp table tt_loss as
+select
+     e.interaction_id
+    ,count(*)                                                       as cnt_any
+    ,count(*) filter (where nullif(trim(ap."Лизингодатель"::text), '') is not null) as cnt_lk
+    ,min(ap."ДатаПокупки")::date                                    as first_purchase_any
+    ,min(ap."ДатаПокупки") filter (where nullif(trim(ap."Лизингодатель"::text), '') is not null)::date as first_purchase_lk
+from tt_episodes2 e
+join dwh."AllPurchases" ap
+    on ap."CtaRepositoryId" = e.cta
+   and ap."ДатаПокупки"::date >  e.started::date
+   and ap."ДатаПокупки"::date <= e.freeze_end::date
+   and ap."IsPurchase" is true
+   and ap."Источник" <> 'ЕП'
+group by e.interaction_id
+;
+
+--================================================================
+-- 5. Итог
+--================================================================
+select
+     coalesce(e.status_name, 'ИТОГО')                                   as "Статус"
+    ,count(*)                                                           as "Эпизодов заморозки"
+    ,count(distinct e.cta)                                              as "Клиентов"
+    -- любая рыночная покупка
+    ,count(*) filter (where l.cnt_any > 0)                              as "Эпизодов с покупкой (любой)"
+    ,count(distinct e.cta) filter (where l.cnt_any > 0)                 as "Клиентов с покупкой (любой)"
+    ,round(count(*) filter (where l.cnt_any > 0) * 100.0 / count(*), 2) as "Доля эпизодов, % (любой)"
+    ,coalesce(sum(l.cnt_any), 0)                                        as "ТС куплено (любой)"
+    -- покупка в другой ЛК
+    ,count(*) filter (where l.cnt_lk > 0)                               as "Эпизодов с покупкой в ЛК"
+    ,count(distinct e.cta) filter (where l.cnt_lk > 0)                  as "Клиентов с покупкой в ЛК"
+    ,round(count(*) filter (where l.cnt_lk > 0) * 100.0 / count(*), 2)  as "Доля эпизодов, % (ЛК)"
+    ,coalesce(sum(l.cnt_lk), 0)                                         as "ТС куплено в ЛК"
+    -- тайминги (по любой покупке)
+    ,percentile_cont(0.5) within group (order by l.first_purchase_any - e.started::date)
+        filter (where l.cnt_any > 0)                                    as "Медиана дней: звонок -> покупка"
+    ,percentile_cont(0.5) within group (order by e.freeze_end::date - l.first_purchase_any)
+        filter (where l.cnt_any > 0)                                    as "Медиана дней заморозки после покупки"
+from tt_episodes2 e
+left join tt_loss l
+    on l.interaction_id = e.interaction_id
+group by grouping sets ((e.status_name), ())
+order by "Статус"
+;
+
+--================================================================
+-- 6. Диагностика: чем закончилась заморозка
+--================================================================
+select
+     end_reason
+    ,count(*)                       as "Эпизодов"
+    ,percentile_cont(0.5) within group (order by freeze_end::date - started::date) as "Медиана дней заморозки"
+from tt_episodes2
+group by end_reason
+order by 2 desc;
