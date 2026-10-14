@@ -43,6 +43,7 @@ select distinct on (li.task)
     ,li.started
     ,li.planned
     ,coalesce(li.cta_repository_id, t.cta_repository_id)  as cta
+    ,t.branch_id
     ,lc."type"                                             as campaign_type
 from voipclient.leasing_interaction li
 join voipclient.leasing_task t
@@ -87,6 +88,7 @@ select
      f.task
     ,max(case when ap."Источник" = 'ЕП'   then 1 else 0 end) as purch_ep
     ,max(case when ap."Источник" = 'ЕФРС' then 1 else 0 end) as purch_not_ep
+    ,min(ap."ДатаПокупки")::date                             as first_purch_dt
 from tt_frozen f
 cross join tt_params p
 join dwh."AllPurchases" ap
@@ -104,6 +106,8 @@ group by f.task
 --================================================================
 select
      f.task                                                        as "Номер задачи"
+    ,f.cta                                                         as "CtaRepositoryId"
+    ,f.branch_id                                                   as "BranchId"
     ,case when f.campaign_type = 1 then 'Исходящие' else 'Входящие' end as "Канал"
     ,case f.campaign_type
           when 1 then 'Исходящий'
@@ -116,6 +120,7 @@ select
             or coalesce(pu.purch_not_ep, 0) = 1 then 1 else 0 end  as "Факт покупки"
     ,coalesce(pu.purch_ep, 0)                                      as "Факт покупки в ЕП"
     ,coalesce(pu.purch_not_ep, 0)                                  as "Факт покупки не в ЕП"
+    ,pu.first_purch_dt                                             as "Дата покупки"   -- первая покупка в окне заморозки (ЕП или не ЕП)
 from tt_frozen f
 left join tt_purch pu
     on pu.task = f.task
