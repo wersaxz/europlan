@@ -205,44 +205,92 @@ group by psl."ProjectId"
 ;
 
 
--- 3.3 МОП по проекту: последний назначенный МОП (роль 6), его должность и оргструктура
+-- 3.3 МОП по проекту: последний назначенный на проект МОП, его должность, суброль и оргструктура
 --     (по эталону «Определение ЦД МОП»; кадры — актуальная запись сотрудника,
---      оргструктура — на текущую дату)
+--      оргструктура — на текущую дату; из оргструктуры выводятся все уровни)
+
+-- 3.3.1 Оргструктура САФО (аналог #SOSH из ОМКДБ)
 drop table if exists tt_org;
 create temp table tt_org as
 select * from ds."FT_SAFO_Org_Structure_History"(null, current_date)
 ;
 
-drop table if exists tt_mop;
-create temp table tt_mop as
-with last_mop as (
-    select distinct on (tcl."ProjectId")
-         tcl."ProjectId"
-        ,tcl."UserId"
-        ,tcl."RoleId"
-        ,tcl."DateFrom"
-    from dwh."SAFO_Projects_TeamChangeLog" tcl
-    join tt_projects tp
-        on tp."Номер проекта" = tcl."ProjectId"
-    where tcl."RoleId" = 6
-    order by tcl."ProjectId", tcl."DateFrom" desc
-)
+-- 3.3.2 Последний МОП по проекту
+drop table if exists tt_last_mop;
+create temp table tt_last_mop as
+select distinct on (tcl."ProjectId")
+     tcl."ProjectId"
+    ,tcl."UserId"
+    ,tcl."DateFrom"
+from dwh."SAFO_Projects_TeamChangeLog" tcl
+join tt_projects tp
+    on tp."Номер проекта" = tcl."ProjectId"
+where tcl."RoleId" = 6                                     -- роль в команде проекта = МОП
+order by tcl."ProjectId", tcl."DateFrom" desc
+;
+
+-- 3.3.3 Справочник субролей МОП (МРК, МРКК, МРКП, МПП по КЦ ...)
+drop table if exists tt_subrole_dict;
+create temp table tt_subrole_dict as
+select distinct on (sr."id")
+     sr."id"
+    ,sr."Name"
+    ,sr."Tag"
+from safo."Org_SubRole" sr
+where sr."RoleId" = 6
+order by sr."id", sr."Version" desc
+;
+
+-- 3.3.4 Суброли МОП: на дату назначения на проект и текущие
+--       (SubRolesMask в логе команды пустой, поэтому берём историю субролей пользователя;
+--        у сотрудника может быть несколько субролей одновременно — склеиваем через запятую)
+drop table if exists tt_mop_subrole;
+create temp table tt_mop_subrole as
 select
      lm."ProjectId"
-    ,lm."RoleId"                       as "Роль МОП (RoleId)"
+    ,string_agg(distinct d."Name", ', ')
+        filter (where lm."DateFrom" >= h."date_from" and lm."DateFrom" < h."date_to")
+                                       as "Суброль МОП на дату назначения"
+    ,string_agg(distinct d."Name", ', ')
+        filter (where h."date_to" > now())
+                                       as "Суброль МОП текущая"
+from tt_last_mop lm
+join dwh."SafoUserSubroleHistory" h
+    on h."UserId" = lm."UserId"
+   and h."RoleId" = 6
+join tt_subrole_dict d
+    on d."id" = h."SubRoleId"
+group by lm."ProjectId"
+;
+
+-- 3.3.5 Итог по МОП
+drop table if exists tt_mop;
+create temp table tt_mop as
+select
+     lm."ProjectId"
     ,lm."DateFrom"::date               as "Дата назначения МОП"
     ,c."Сотрудник"                     as "ФИО МОП"
     ,c."Логин"                         as "Логин МОП"
     ,c."Должность"                     as "Должность МОП"
-    ,c."Подразделение"                 as "Подразделение МОП"
-    ,org."department_name"             as "Отдел МОП"
-    ,org."profitcenter_name"           as "ЦД МОП (оргструктура)"
-    ,org."revenuecenter_name"          as "ЦП МОП"
-    ,org."division_name"               as "Дивизион МОП"
-from last_mop lm
+    ,c."DefaultRoleName"               as "Роль МОП"                -- основная роль в САФО
+    ,coalesce(sr."Суброль МОП на дату назначения", sr."Суброль МОП текущая")
+                                       as "Суброль МОП"             -- на дату назначения, иначе текущая
+    ,sr."Суброль МОП на дату назначения"
+    ,sr."Суброль МОП текущая"
+    ,c."Подразделение"                 as "Подразделение МОП"      -- кадровое (1С), групп МО-1/МО-2 тут нет
+    ,org."Name"                        as "Группа МОП"             -- узел САФО: 'ОПП ДКС МО-1 (Аленин Михаил)' и т.п.
+    ,case when c."Подразделение" = 'Сектор прямых продаж ДКС'
+            or org."Name" ilike 'ОПП ДКС%'                         -- группы Аленина / Морозикова
+          then 'Проект на МПП ДКС'
+          else 'Проект на другой функции'
+     end                               as "МПП"
+    ,org.*                                                  -- все уровни оргструктуры МОП
+from tt_last_mop lm
 left join dwh."Сотрудники" c
     on c."UserID_SAFO" = lm."UserId"
    and c."ActualRow" = 1
+left join tt_mop_subrole sr
+    on sr."ProjectId" = lm."ProjectId"
 left join tt_org org
     on org."subdivisionid" = c."SubdivisionId_SAFO_actual"
 ;
@@ -418,16 +466,7 @@ select
     ,tr."Дата первой передачи"::date                                               as "Дата первой передачи"
     ,tp."Дивизион по МОП"                                                           as "Дивизион"
     ,tp."ЦД МОП"
-    ,mp."ФИО МОП"
-    ,mp."Логин МОП"
-    ,mp."Должность МОП"
-    ,mp."Роль МОП (RoleId)"
-    ,mp."Дата назначения МОП"
-    ,mp."Подразделение МОП"
-    ,mp."Отдел МОП"
-    ,mp."ЦД МОП (оргструктура)"
-    ,mp."ЦП МОП"
-    ,mp."Дивизион МОП"
+    ,mp.*                                                                           -- МОП: ФИО, должность, подразделение, МПП, все уровни оргструктуры
     ,coalesce(pu."ЕП", 0)                                                           as "ЕП"
     ,coalesce(pu."не ЕП", 0)                                                        as "не ЕП"
     ,pu."Дата первой покупки в ЕП"::date                                           as "Дата первой покупки в ЕП"
