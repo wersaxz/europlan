@@ -205,28 +205,30 @@ group by psl."ProjectId"
 ;
 
 
--- 3.3 МОП по проекту: последний назначенный на проект МОП, его должность, суброль и оргструктура
---     (по эталону «Определение ЦД МОП»; кадры — актуальная запись сотрудника,
---      оргструктура — на текущую дату; из оргструктуры выводятся все уровни)
+-- 3.3 МОП по проекту — как в оригинале ОМКДБ (#logMOP / #teamlog / #SOSH):
+--     последний МОП из лога команды САФО (RoleId = 6),
+--     сотрудник — запись кадров, действующая на момент назначения,
+--     ЦП МОП — через центр дохода подразделения (#SOSH),
+--     + «Группа МОП» (узел оргструктуры САФО: группы Аленина / Морозикова)
 
--- 3.3.1 Оргструктура САФО (аналог #SOSH из ОМКДБ)
+-- 3.3.1 Оргструктура САФО (аналог #SOSH)
 drop table if exists tt_org;
 create temp table tt_org as
 select * from ds."FT_SAFO_Org_Structure_History"(null, current_date)
 ;
 
--- 3.3.2 Последний МОП по проекту
+-- 3.3.2 Последний МОП по проекту (аналог #logMOP + #teamlog rn = 1)
 drop table if exists tt_last_mop;
 create temp table tt_last_mop as
-select distinct on (tcl."ProjectId")
-     tcl."ProjectId"
-    ,tcl."UserId"
-    ,tcl."DateFrom"
-from dwh."SAFO_Projects_TeamChangeLog" tcl
+select distinct on (l."ProjectId")
+     l."ProjectId"
+    ,l."NewUserId"
+    ,l."DateTime"
+from safo."Projects_TeamChangeLog" l
 join tt_projects tp
-    on tp."Номер проекта" = tcl."ProjectId"
-where tcl."RoleId" = 6                                     -- роль в команде проекта = МОП
-order by tcl."ProjectId", tcl."DateFrom" desc
+    on tp."Номер проекта" = l."ProjectId"
+where l."RoleId" = 6                                       -- роль в команде проекта = МОП
+order by l."ProjectId", l."DateTime" desc
 ;
 
 -- 3.3.3 Справочник субролей МОП (МРК, МРКК, МРКП, МПП по КЦ ...)
@@ -236,63 +238,68 @@ select distinct on (sr."id")
      sr."id"
     ,sr."Name"
     ,sr."Tag"
+    ,sr."Mask"
 from safo."Org_SubRole" sr
 where sr."RoleId" = 6
 order by sr."id", sr."Version" desc
 ;
 
--- 3.3.4 Суброли МОП: на дату назначения на проект и текущие
---       (SubRolesMask в логе команды пустой, поэтому берём историю субролей пользователя;
---        у сотрудника может быть несколько субролей одновременно — склеиваем через запятую)
-drop table if exists tt_mop_subrole;
-create temp table tt_mop_subrole as
-select
-     lm."ProjectId"
-    ,string_agg(distinct d."Name", ', ')
-        filter (where lm."DateFrom" >= h."date_from" and lm."DateFrom" < h."date_to")
-                                       as "Суброль МОП на дату назначения"
-    ,string_agg(distinct d."Name", ', ')
-        filter (where h."date_to" > now())
-                                       as "Суброль МОП текущая"
-from tt_last_mop lm
-join dwh."SafoUserSubroleHistory" h
-    on h."UserId" = lm."UserId"
-   and h."RoleId" = 6
+-- история субролей МОП: только роль МОП, только наши МОП — с индексом для быстрого поиска
+drop table if exists tt_subrole_hist;
+create temp table tt_subrole_hist as
+select h."UserId", h."date_from", h."date_to", d."Name", d."Tag", d."Mask"
+from dwh."SafoUserSubroleHistory" h
 join tt_subrole_dict d
     on d."id" = h."SubRoleId"
-group by lm."ProjectId"
+where h."RoleId" = 6
+  and h."UserId" in (select "NewUserId" from tt_last_mop)
 ;
+create index on tt_subrole_hist ("UserId");
+analyze tt_subrole_hist;
 
--- 3.3.5 Итог по МОП
+-- 3.3.4 Итог по МОП
 drop table if exists tt_mop;
 create temp table tt_mop as
 select
      lm."ProjectId"
-    ,lm."DateFrom"::date               as "Дата назначения МОП"
     ,c."Сотрудник"                     as "ФИО МОП"
-    ,c."Логин"                         as "Логин МОП"
     ,c."Должность"                     as "Должность МОП"
-    ,c."DefaultRoleName"               as "Роль МОП"                -- основная роль в САФО
-    ,coalesce(sr."Суброль МОП на дату назначения", sr."Суброль МОП текущая")
-                                       as "Суброль МОП"             -- на дату назначения, иначе текущая
-    ,sr."Суброль МОП на дату назначения"
-    ,sr."Суброль МОП текущая"
-    ,c."Подразделение"                 as "Подразделение МОП"      -- кадровое (1С), групп МО-1/МО-2 тут нет
-    ,org."Name"                        as "Группа МОП"             -- узел САФО: 'ОПП ДКС МО-1 (Аленин Михаил)' и т.п.
+    ,c."Подразделение"                 as "Подразделение МОП"
+    ,org."Name"                        as "Группа МОП"             -- 'ОПП ДКС МО-1 (Аленин Михаил)' и т.п.
+    ,sr."Name"                         as "Суброль МОП"            -- одна, действующая на момент назначения на проект
+    ,sosh."revenuecenter_name"         as "ЦП МОП"
     ,case when c."Подразделение" = 'Сектор прямых продаж ДКС'
             or org."Name" ilike 'ОПП ДКС%'                         -- группы Аленина / Морозикова
           then 'Проект на МПП ДКС'
           else 'Проект на другой функции'
      end                               as "МПП"
-    ,org.*                                                  -- все уровни оргструктуры МОП
 from tt_last_mop lm
-left join dwh."Сотрудники" c
-    on c."UserID_SAFO" = lm."UserId"
-   and c."ActualRow" = 1
-left join tt_mop_subrole sr
-    on sr."ProjectId" = lm."ProjectId"
-left join tt_org org
+left join lateral (                                         -- кадры на момент назначения МОП
+    select c.*
+    from dwh."Сотрудники" c
+    where c."UserID_SAFO" = lm."NewUserId"
+      and lm."DateTime" between c."DateFrom" and c."DateTo"
+    order by c."DateFrom" desc
+    limit 1
+) c on true
+left join lateral (                                         -- суброль МОП на момент назначения на проект
+    select h."Name"
+    from tt_subrole_hist h
+    where h."UserId" = lm."NewUserId"
+      and lm."DateTime" >= h."date_from"
+      and lm."DateTime" <  h."date_to"
+    order by
+         case when h."Tag" in ('MCr', 'Inactive', 'TM') then 1 else 0 end  -- служебные (МКр, Пассивный, Тренинг менеджер) — только если других нет
+        ,h."date_from" desc                                                 -- из рабочих — последняя выданная
+        ,h."Mask"
+    limit 1
+) sr on true
+left join tt_org org                                        -- группа МОП
     on org."subdivisionid" = c."SubdivisionId_SAFO_actual"
+left join dwh."SAFO_Org_Structure" sorg                     -- как в оригинале: подразделение -> центр дохода
+    on sorg."id" = c."SubdivisionId_SAFO_actual"
+left join tt_org sosh
+    on sosh."subdivisionid" = sorg."ProfitCenterId"
 ;
 
 
@@ -466,7 +473,7 @@ select
     ,tr."Дата первой передачи"::date                                               as "Дата первой передачи"
     ,tp."Дивизион по МОП"                                                           as "Дивизион"
     ,tp."ЦД МОП"
-    ,mp.*                                                                           -- МОП: ФИО, должность, подразделение, МПП, все уровни оргструктуры
+    ,mp.*                                                                           -- МОП: ФИО, должность, подразделение, группа, ЦП, МПП
     ,coalesce(pu."ЕП", 0)                                                           as "ЕП"
     ,coalesce(pu."не ЕП", 0)                                                        as "не ЕП"
     ,pu."Дата первой покупки в ЕП"::date                                           as "Дата первой покупки в ЕП"
