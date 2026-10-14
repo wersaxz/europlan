@@ -33,7 +33,7 @@ select
      date '2025-01-01'           as date_from      -- проекты, созданные с
     ,current_date                as date_to        -- и до (не включая): по текущую дату, период режется в сводных
     ,60                          as purchase_days  -- окно покупок от создания проекта, дней
-    ,60                          as transfer_days_win  -- окно передачи для доли побед = окну покупок (Качество), дней
+    ,60                          as transfer_days_win  -- окно передачи для доли побед = окну покупок («Факт покупки на рынке 60 дней»), дней
     ,120                         as transfer_days  -- окно передачи (прямой и через перезаведённый проект), дней
     ,5                           as our_stage_id   -- safo."Projects_Status"."StageId" этапа анализа / ОУР
     ,30                          as meet_event     -- cwc: «Задача МОП (ЦУЗ) - встреча»
@@ -507,7 +507,7 @@ select
     ,tp."Тип задачи (payload_type)"
     ,tp."Есть задача поставщиков"
     ,tp."Повторный по ГК"                                                           as "Повторный клиент по ЮЛ/ГК"
-    ,case when coalesce(pu."ЕП", 0) > 0 or coalesce(pu."не ЕП", 0) > 0 then 1 else 0 end as "Качество"
+    ,case when coalesce(pu."ЕП", 0) > 0 or coalesce(pu."не ЕП", 0) > 0 then 1 else 0 end as "Факт покупки на рынке 60 дней"   -- клиент купил ТС на рынке (включая ЕП) за 60 дней от создания проекта
     -- встречи
     ,case when o."ProjectId" is not null then 1 else 0 end                          as "Был передан на ОУР"
     ,o."Дата начала ОУР"::date                                                     as "Дата начала ОУР"
