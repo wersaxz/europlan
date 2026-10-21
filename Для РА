@@ -1,21 +1,22 @@
 --================================================================
--- Срок жизни задачи ИСКЦ: исходящий и входящий каналы ДКС (без поставщиков)
--- Только задачи, завершившиеся дозвоном (последняя интеракция ≠ недозвон)
--- От завершения первой интеракции до завершения последней
+-- Срок жизни цепочки разговоров по задаче ИСКЦ
+-- Исходящий и входящий каналы ДКС (без поставщиков)
+-- От завершения первого разговора до завершения последнего
 --================================================================
 
-drop table if exists tt_task_life;
-create temp table tt_task_life as
+drop table if exists tt_task_dialogs;
+create temp table tt_task_dialogs as
 select
      i.task
     ,case when lc.type = 1 then 'Исходящий'
           else 'Входящий'
-     end                                                                         as "Канал"
-    ,min(i.ended)                                                                as first_end
-    ,max(i.ended)                                                                as last_end
-    ,count(*)                                                                    as cnt_interactions
-    ,count(*) filter (where cc.name is distinct from 'leasing.call_failed')      as cnt_dialogs        -- состоявшиеся диалоги
-    ,(array_agg(cc.name order by i.ended desc))[1]                               as last_class_name    -- класс последней интеракции
+     end                                                                              as "Канал"
+    ,count(*)                                                                         as cnt_interactions
+    ,count(*)     filter (where cc.name is distinct from 'leasing.call_failed')       as cnt_dialogs        -- разговоры
+    ,min(i.ended) filter (where cc.name is distinct from 'leasing.call_failed')       as first_dialog_end
+    ,max(i.ended) filter (where cc.name is distinct from 'leasing.call_failed')       as last_dialog_end
+    ,max(i.ended)                                                                     as last_end           -- последняя интеракция (для периода)
+    ,(array_agg(cc.name order by i.ended desc))[1]                                    as last_class_name
 from voipclient.leasing_task t
     join voipclient.leasing_campaign lc
         on lc.id = t.campaign
@@ -36,70 +37,79 @@ group by
     ,2
 having max(i.ended) >= current_date - interval '1 year'
    and max(i.ended) <  current_date
+   and count(*) filter (where cc.name is distinct from 'leasing.call_failed') >= 1   -- был хотя бы один разговор
 ;
 
---================================================================
--- Отбор: задача завершилась дозвоном
---================================================================
-drop table if exists tt_task_life_dial;
-create temp table tt_task_life_dial as
+drop table if exists tt_chain;
+create temp table tt_chain as
 select
      "Канал"
-    ,case when cnt_dialogs >= 2 then '2+ диалога' else '1 диалог' end      as "Диалогов в задаче"
-    ,cnt_interactions
+    ,case when cnt_dialogs >= 2 then '2+ разговора' else '1 разговор' end                      as "Разговоров в задаче"
     ,cnt_dialogs
-    ,extract(epoch from (last_end - first_end))::numeric / 86400           as days
-from tt_task_life
-where last_class_name is distinct from 'leasing.call_failed'
+    ,extract(epoch from (last_dialog_end - first_dialog_end))::numeric / 86400                 as days
+from tt_task_dialogs
+--where last_class_name is distinct from 'leasing.call_failed'   -- раскомментировать для старого фильтра «завершилась дозвоном»
 ;
 
 --================================================================
--- 1. Распределение по каналам, числу диалогов и корзинам 0–10 … 100+
+-- 1. Сводка: сколько задач с 1 и 2+ разговорами
+--================================================================
+select
+     "Канал"
+    ,"Разговоров в задаче"
+    ,count(*)                                                                    as "Кол-во задач"
+    ,round(100.0 * count(*) / sum(count(*)) over (partition by "Канал"), 1)      as "Доля в канале, %"
+    ,round(avg(cnt_dialogs), 1)                                                  as "Среднее кол-во разговоров"
+from tt_chain
+group by
+     "Канал"
+    ,"Разговоров в задаче"
+order by
+     "Канал"
+    ,"Разговоров в задаче"
+;
+
+--================================================================
+-- 2. Распределение цепочек (2+ разговора) по корзинам 0–10 … 100+
 --================================================================
 with g as (
     select
          case when days >= 100 then 100 else floor(days / 10)::int * 10 end as bucket
         ,*
-    from tt_task_life_dial
+    from tt_chain
+    where cnt_dialogs >= 2
 )
 select
      "Канал"
-    ,"Диалогов в задаче"
     ,case when bucket = 100 then '100+'
           else bucket || '–' || (bucket + 10)
-     end                                                                                          as "Срок жизни, дн."
-    ,count(*)                                                                                     as "Кол-во задач"
-    ,round(100.0 * count(*) / sum(count(*)) over (partition by "Канал", "Диалогов в задаче"), 1)  as "Доля в группе, %"
-    ,round(avg(days), 1)                                                                          as "Среднее, дн."
-    ,round(avg(cnt_dialogs), 1)                                                                   as "Среднее кол-во диалогов"
+     end                                                                         as "Срок цепочки, дн."
+    ,count(*)                                                                    as "Кол-во задач"
+    ,round(100.0 * count(*) / sum(count(*)) over (partition by "Канал"), 1)      as "Доля в канале, %"
+    ,round(avg(days), 1)                                                         as "Среднее, дн."
+    ,round(avg(cnt_dialogs), 1)                                                  as "Среднее кол-во разговоров"
 from g
 group by
      "Канал"
-    ,"Диалогов в задаче"
     ,bucket
 order by
      "Канал"
-    ,"Диалогов в задаче"
     ,bucket
 ;
 
 --================================================================
--- 2. Итого: среднее, медиана, перцентили по каналам и числу диалогов
+-- 3. Итого по цепочкам (2+ разговора): среднее, медиана, перцентили
 --================================================================
 select
      "Канал"
-    ,"Диалогов в задаче"
     ,count(*)                                                                     as "Кол-во задач"
     ,round(avg(days), 1)                                                          as "Среднее, дн."
     ,round(percentile_cont(0.5)  within group (order by days)::numeric, 1)        as "Медиана, дн."
     ,round(percentile_cont(0.75) within group (order by days)::numeric, 1)        as "75-й перцентиль, дн."
     ,round(percentile_cont(0.9)  within group (order by days)::numeric, 1)        as "90-й перцентиль, дн."
-    ,round(avg(cnt_dialogs), 1)                                                   as "Среднее кол-во диалогов"
-from tt_task_life_dial
-group by
-     "Канал"
-    ,"Диалогов в задаче"
-order by
-     "Канал"
-    ,"Диалогов в задаче"
+    ,round(avg(cnt_dialogs), 1)                                                   as "Среднее кол-во разговоров"
+from tt_chain
+where cnt_dialogs >= 2
+group by "Канал"
+order by "Канал"
 ;
