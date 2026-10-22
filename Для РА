@@ -1,22 +1,15 @@
 --================================================================
--- Срок жизни цепочки разговоров по задаче ИСКЦ
+-- Пауза между соседними разговорами в цепочке (задача + логин)
 -- Исходящий и входящий каналы ДКС (без поставщиков)
--- От завершения первого разговора до завершения последнего
+-- Пауза = начало следующего разговора − окончание предыдущего
 --================================================================
 
-drop table if exists tt_task_dialogs;
-create temp table tt_task_dialogs as
+-- 1. Задачи: завершённые, без поставщиков, последняя интеракция за последний год
+drop table if exists tt_tasks;
+create temp table tt_tasks as
 select
-     i.task
-    ,case when lc.type = 1 then 'Исходящий'
-          else 'Входящий'
-     end                                                                              as "Канал"
-    ,count(*)                                                                         as cnt_interactions
-    ,count(*)     filter (where cc.name is distinct from 'leasing.call_failed')       as cnt_dialogs        -- разговоры
-    ,min(i.ended) filter (where cc.name is distinct from 'leasing.call_failed')       as first_dialog_end
-    ,max(i.ended) filter (where cc.name is distinct from 'leasing.call_failed')       as last_dialog_end
-    ,max(i.ended)                                                                     as last_end           -- последняя интеракция (для периода)
-    ,(array_agg(cc.name order by i.ended desc))[1]                                    as last_class_name
+     t.id as task
+    ,case when lc.type = 1 then 'Исходящий' else 'Входящий' end   as "Канал"
 from voipclient.leasing_task t
     join voipclient.leasing_campaign lc
         on lc.id = t.campaign
@@ -24,92 +17,130 @@ from voipclient.leasing_task t
     join voipclient.leasing_interaction i
         on i.task = t.id
        and i.ended is not null
-       --and i.operator != 1                             -- раскомментировать, чтобы исключить бота-автодозвон
-    left join voipclient.configuration_status cs
-        on cs.id = i.status
-    left join voipclient.configuration_class cc
-        on cc.id = cs.class
 where t.status in (122, 233)                             -- задача завершена
   and coalesce(t.payload_type, '') <> 'partners'         -- исключаем поставщиков
-  and t.created_at >= current_date - interval '2 years'  -- ограничение для скорости, на результат не влияет
+  and t.created_at >= current_date - interval '2 years'  -- ограничение для скорости
 group by
-     i.task
-    ,2
+     t.id
+    ,lc.type
 having max(i.ended) >= current_date - interval '1 year'
    and max(i.ended) <  current_date
-   and count(*) filter (where cc.name is distinct from 'leasing.call_failed') >= 1   -- был хотя бы один разговор
 ;
 
-drop table if exists tt_chain;
-create temp table tt_chain as
+-- 2. Разговоры по этим задачам и пауза до следующего разговора
+drop table if exists tt_gaps;
+create temp table tt_gaps as
+with d as (
+    select
+         tt.task
+        ,tt."Канал"
+        ,i.operator
+        ,i.started
+        ,i.ended
+    from tt_tasks tt
+        join voipclient.leasing_interaction i
+            on i.task = tt.task
+           and i.started is not null
+           and i.ended   is not null
+           and i.operator != 1                           -- без бота
+        left join voipclient.configuration_status cs
+            on cs.id = i.status
+        left join voipclient.configuration_class cc
+            on cc.id = cs.class
+    where cc.name is distinct from 'leasing.call_failed' -- только разговоры
+)
+,p as (
+    select
+         task
+        ,"Канал"
+        ,ended                                                                as prev_end
+        ,lead(started) over (partition by task, operator order by started)    as next_start   -- убрать operator, чтобы считать по задаче целиком
+    from d
+)
 select
-     "Канал"
-    ,case when cnt_dialogs >= 2 then '2+ разговора' else '1 разговор' end                      as "Разговоров в задаче"
-    ,cnt_dialogs
-    ,extract(epoch from (last_dialog_end - first_dialog_end))::numeric / 86400                 as days
-from tt_task_dialogs
---where last_class_name is distinct from 'leasing.call_failed'   -- раскомментировать для старого фильтра «завершилась дозвоном»
+     task
+    ,"Канал"
+    ,greatest(extract(epoch from (next_start - prev_end))::numeric / 86400, 0) as gap_days
+from p
+where next_start is not null
 ;
 
 --================================================================
--- 1. Сводка: сколько задач с 1 и 2+ разговорами
---================================================================
-select
-     "Канал"
-    ,"Разговоров в задаче"
-    ,count(*)                                                                    as "Кол-во задач"
-    ,round(100.0 * count(*) / sum(count(*)) over (partition by "Канал"), 1)      as "Доля в канале, %"
-    ,round(avg(cnt_dialogs), 1)                                                  as "Среднее кол-во разговоров"
-from tt_chain
-group by
-     "Канал"
-    ,"Разговоров в задаче"
-order by
-     "Канал"
-    ,"Разговоров в задаче"
-;
-
---================================================================
--- 2. Распределение цепочек (2+ разговора) по корзинам 0–10 … 100+
+-- 3. Распределение пауз по дням с накопительной долей
 --================================================================
 with g as (
     select
-         case when days >= 100 then 100 else floor(days / 10)::int * 10 end as bucket
-        ,*
-    from tt_chain
-    where cnt_dialogs >= 2
+         "Канал"
+        ,gap_days
+        ,case
+            when gap_days < 15  then floor(gap_days)::int          -- 0, 1, 2 … 14 — по дням
+            when gap_days < 22  then 15
+            when gap_days < 31  then 22
+            when gap_days < 61  then 31
+            when gap_days < 91  then 61
+            else 91
+         end as bucket
+    from tt_gaps
+)
+,a as (
+    select
+         "Канал"
+        ,bucket
+        ,count(*)        as cnt
+        ,avg(gap_days)   as avg_days
+    from g
+    group by "Канал", bucket
 )
 select
      "Канал"
-    ,case when bucket = 100 then '100+'
-          else bucket || '–' || (bucket + 10)
-     end                                                                         as "Срок цепочки, дн."
-    ,count(*)                                                                    as "Кол-во задач"
-    ,round(100.0 * count(*) / sum(count(*)) over (partition by "Канал"), 1)      as "Доля в канале, %"
-    ,round(avg(days), 1)                                                         as "Среднее, дн."
-    ,round(avg(cnt_dialogs), 1)                                                  as "Среднее кол-во разговоров"
-from g
-group by
-     "Канал"
-    ,bucket
+    ,case
+        when bucket < 15  then bucket || '–' || (bucket + 1)
+        when bucket = 15  then '15–21'
+        when bucket = 22  then '22–30'
+        when bucket = 31  then '31–60'
+        when bucket = 61  then '61–90'
+        else '91+'
+     end                                                                                         as "Пауза, дн."
+    ,cnt                                                                                         as "Кол-во пауз"
+    ,round(100.0 * cnt / sum(cnt) over (partition by "Канал"), 1)                                as "Доля, %"
+    ,round(100.0 * sum(cnt) over (partition by "Канал" order by bucket)
+                 / sum(cnt) over (partition by "Канал"), 1)                                      as "Накопительно, %"
+    ,round(avg_days, 1)                                                                          as "Среднее, дн."
+from a
 order by
      "Канал"
     ,bucket
 ;
 
 --================================================================
--- 3. Итого по цепочкам (2+ разговора): среднее, медиана, перцентили
+-- 4. Перцентили пауз
 --================================================================
 select
      "Канал"
-    ,count(*)                                                                     as "Кол-во задач"
-    ,round(avg(days), 1)                                                          as "Среднее, дн."
-    ,round(percentile_cont(0.5)  within group (order by days)::numeric, 1)        as "Медиана, дн."
-    ,round(percentile_cont(0.75) within group (order by days)::numeric, 1)        as "75-й перцентиль, дн."
-    ,round(percentile_cont(0.9)  within group (order by days)::numeric, 1)        as "90-й перцентиль, дн."
-    ,round(avg(cnt_dialogs), 1)                                                   as "Среднее кол-во разговоров"
-from tt_chain
-where cnt_dialogs >= 2
+    ,count(*)                                                                      as "Кол-во пауз"
+    ,round(percentile_cont(0.5)  within group (order by gap_days)::numeric, 1)    as "Медиана, дн."
+    ,round(percentile_cont(0.75) within group (order by gap_days)::numeric, 1)    as "75-й, дн."
+    ,round(percentile_cont(0.8)  within group (order by gap_days)::numeric, 1)    as "80-й, дн."
+    ,round(percentile_cont(0.85) within group (order by gap_days)::numeric, 1)    as "85-й, дн."
+    ,round(percentile_cont(0.9)  within group (order by gap_days)::numeric, 1)    as "90-й, дн."
+    ,round(percentile_cont(0.95) within group (order by gap_days)::numeric, 1)    as "95-й, дн."
+from tt_gaps
+group by "Канал"
+order by "Канал"
+;
+
+--================================================================
+-- 5. Сколько пауз укладывается в кандидаты на порог Х-периода
+--================================================================
+select
+     "Канал"
+    ,count(*)                                                                          as "Кол-во пауз"
+    ,round(100.0 * count(*) filter (where gap_days <= 7)  / count(*), 1)               as "≤ 7 дн., %"
+    ,round(100.0 * count(*) filter (where gap_days <= 10) / count(*), 1)               as "≤ 10 дн., %"
+    ,round(100.0 * count(*) filter (where gap_days <= 14) / count(*), 1)               as "≤ 14 дн., %"
+    ,round(100.0 * count(*) filter (where gap_days <= 21) / count(*), 1)               as "≤ 21 дн., %"
+    ,round(100.0 * count(*) filter (where gap_days <= 30) / count(*), 1)               as "≤ 30 дн., %"
+from tt_gaps
 group by "Канал"
 order by "Канал"
 ;
