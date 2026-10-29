@@ -1,3 +1,5 @@
+-- ВЕРСИЯ «ПО ПРОЕКТУ»: все поля встреч считаются только по встречам, привязанным к проекту (задача ЦУЗ с ProjectId).
+-- Набор и названия полей — как в версии «по КА» (по контрагенту).
 --================================================================
 -- Встречи ДКС: назначение vs проведение (PostgreSQL, db-warehouse-production)
 -- Перенос скрипта «Встречи для фронта и ДКС» с ОМКДБ на хранилище
@@ -414,7 +416,23 @@ analyze tt_meet_raw;
 
 
 --================================================================
--- 7. Привязка встреч к проекту ДКС (по контрагенту, в окне проекта)
+-- 6.1 Связка встречи с проектом: задача ЦУЗ (cwc.event_id = SalesTasks.TaskId) с ProjectId
+--     ВЕРСИЯ «ПО ПРОЕКТУ»: учитываются только встречи, привязанные к самому проекту ДКС
+--================================================================
+drop table if exists tt_meet_task_proj;
+create temp table tt_meet_task_proj as
+select distinct
+     st."TaskId"::text as event_id
+    ,st."ProjectId"
+from dwh."SalesTasks" st
+where st."ProjectId" in (select "Номер проекта" from tt_projects)
+;
+create index on tt_meet_task_proj (event_id);
+analyze tt_meet_task_proj;
+
+
+--================================================================
+-- 7. Привязка встреч к проекту ДКС (ПО ПРОЕКТУ: только встречи, привязанные к проекту, в окне проекта)
 --    Окно «до ОУР»:     [создание проекта; первый вход на ОУР)
 --                       если ОУР не было — до архива / по сей день
 --    Окно «в принципе»: [создание проекта; архив / первая передача + 1 день / сегодня]
@@ -451,55 +469,6 @@ select
                                     'infinity'::timestamp)
      ) as "Кол-во встреч всего"
 from w
-join tt_meet_raw m
-    on m."CtaRepositoryId" = w."CtaRepositoryId"
-   and m.meet_dt >= w."Дата создания проекта"
-group by w."Номер проекта"
-;
-
-
---================================================================
--- 7.1 Встречи, привязанные к проекту (логика премирования):
---     задача ЦУЗ встречи (cwc.event_id = SalesTasks.TaskId) с заполненным ProjectId = проект ДКС.
---     Окна те же, что в блоке 7.
---================================================================
-drop table if exists tt_meet_task_proj;
-create temp table tt_meet_task_proj as
-select distinct
-     st."TaskId"::text as event_id
-    ,st."ProjectId"
-from dwh."SalesTasks" st
-where st."ProjectId" in (select "Номер проекта" from tt_projects)
-;
-create index on tt_meet_task_proj (event_id);
-analyze tt_meet_task_proj;
-
-drop table if exists tt_meet_proj;
-create temp table tt_meet_proj as
-with w as (
-    select
-         tp."Номер проекта"
-        ,tp."Дата создания проекта"
-        ,o."Дата начала ОУР"
-        ,case when tp."Этап" = 'Архив' then ls."Последняя дата работы над проектом" end as archive_dt
-        ,tr."Дата первой передачи"
-    from tt_projects tp
-    left join tt_our o          on o."ProjectId" = tp."Номер проекта"
-    left join tt_last_status ls on ls."ProjectId" = tp."Номер проекта"
-    left join tt_transfer tr    on tr."Номер проекта" = tp."Номер проекта"
-)
-select
-     w."Номер проекта"
-    ,count(*) filter (
-        where m.meet_dt < coalesce(w."Дата начала ОУР", w.archive_dt, 'infinity'::timestamp)
-     ) as "Кол-во встреч по проекту до ОУР"
-    ,count(*) filter (
-        where m.meet_dt <= coalesce(w.archive_dt,
-                                    w."Дата первой передачи" + interval '1 day',
-                                    'infinity'::timestamp)
-     ) as "Кол-во встреч по проекту всего"
-    ,count(*) as "Кол-во встреч по проекту без окна"
-from w
 join tt_meet_task_proj tpj
     on tpj."ProjectId" = w."Номер проекта"
 join tt_meet_raw m
@@ -507,6 +476,9 @@ join tt_meet_raw m
    and m.meet_dt >= w."Дата создания проекта"
 group by w."Номер проекта"
 ;
+
+
+
 
 
 --================================================================
@@ -570,10 +542,6 @@ select
     ,case when coalesce(mt."Кол-во встреч до ОУР", 0) > 0 then 1 else 0 end         as "Встреча актуальная"  -- проведена до ОУР (продающая)
     ,case when coalesce(mt."Кол-во встреч всего", 0) > 0 then 1 else 0 end          as "Встреча в принципе"
     ,coalesce(mt."Кол-во встреч до ОУР", 0)                                         as "Кол-во встреч до ОУР"
-    -- встречи, привязанные к проекту (логика премирования)
-    ,case when coalesce(mp2."Кол-во встреч по проекту до ОУР", 0) > 0 then 1 else 0 end    as "Встреча по проекту актуальная"
-    ,case when coalesce(mp2."Кол-во встреч по проекту всего", 0) > 0 then 1 else 0 end     as "Встреча по проекту в принципе"
-    ,case when coalesce(mp2."Кол-во встреч по проекту без окна", 0) > 0 then 1 else 0 end  as "Встреча по проекту без окна"
     ,mt."Дата первой встречи до ОУР"::date                                         as "Дата первой встречи до ОУР"
     ,tp."Встреча назначена"
     ,rs."reasonProjectWithoutMeet"
@@ -584,7 +552,6 @@ left join tt_our o          on o."ProjectId"      = tp."Номер проект�
 left join tt_transfer tr    on tr."Номер проекта" = tp."Номер проекта"
 left join tt_purchases pu   on pu."Номер проекта" = tp."Номер проекта"
 left join tt_meet mt        on mt."Номер проекта" = tp."Номер проекта"
-left join tt_meet_proj mp2  on mp2."Номер проекта" = tp."Номер проекта"
 left join tt_reason rs      on rs.project_id      = tp."Номер проекта"
 left join tt_mop mp         on mp."ProjectId"     = tp."Номер проекта"
 order by tp."Дата создания проекта"
