@@ -1,28 +1,25 @@
--- ВЕРСИЯ «ПО ПРОЕКТУ»: все поля встреч считаются только по встречам, привязанным к проекту (задача ЦУЗ с ProjectId).
--- Набор и названия полей — как в версии «по КА» (по контрагенту).
 --================================================================
 -- Встречи ДКС: назначение vs проведение (PostgreSQL, db-warehouse-production)
--- Перенос скрипта «Встречи для фронта и ДКС» с ОМКДБ на хранилище
+-- ВЕРСИЯ «ПО ПРОЕКТУ + КАНАЛЫ НОРМАТИВА»
 --
--- Одна строка = один проект ДКС (Исходящие / Входящие, без поставщиков)
+-- Одна строка = один проект ДКС
 --
 -- Ключевые допущения:
 --  * Встреча = событие cwc event_type = 30 «Задача МОП (ЦУЗ) - встреча»,
---    привязка ПО КОНТРАГЕНТУ (CtaRepositoryId): любая встреча МОП с клиентом
---    в окне проекта ДКС, вне зависимости от проекта, в котором она оформлена
---  * Встреча до проекта не засчитывается (окно — от даты создания проекта)
---  * «Встреча до ОУР» — встреча до первого входа проекта в этап StageId = 5
---    (анализ / ОУР); если на ОУР не выходил — до архива или по сей день
+--    привязанная К ПРОЕКТУ: задача ЦУЗ (cwc.event_id = dwh."SalesTasks"."TaskId")
+--    с ProjectId = номер проекта ДКС (логика норматива по встречам)
+--  * Окно встречи = период жизни проекта:
+--    [создание проекта; архив / первая передача + 1 день / сегодня]. ОУР не используется
 --  * Время cwc (UTC) приводится к МСК; даты САФО считаются в МСК
 --  * «Встреча назначена» — флаг витрины ds."DCC_Tasks_BA_Info"
---  * Канал — по voipclient.leasing_campaign.type первой задачи проекта:
---    1 = Исходящие; 2, 3 = Входящие; канал поставщиков (payload_type = 'partners') исключён
---  * «Группа источника обращения» не фильтруется (выводится справочно): у входящих
---    ДКС-проектов САФО почти всегда пишет «Поставщики», это не канал поставщиков
---  * Передачи считаются в окне 120 дней от создания проекта ДКС:
---    «по прямому» — договор лизинга по самому проекту ДКС;
---    «по всем» — по самому проекту ИЛИ по перезаведённому проекту
---    (dwh."ProjectMarketingCommunicationChannelAttribution": OriginalProjectId -> ProjectId)
+--  * «Канал норматив» — по первой задаче проекта (voipclient.leasing_campaign):
+--      type 1, без поставщиков (payload_type <> 'partners') -> Исходящие
+--      type 2                                              -> Звонки
+--      type 3, кампания 390 «Заявки от партнеров»          -> Поставщики
+--      type 3, кампания 508 «Заявки от сотрудников АльфаБанка» -> Банк
+--      type 3, остальные кампании                          -> Заявки
+--  * Оператор ДКС — первая итерация с проектом (не бот, operator <> 1)
+--  * Передачи: прямые и через перезаведённый проект, окна 120 и 60 дней
 --================================================================
 
 
@@ -32,12 +29,11 @@
 drop table if exists tt_params;
 create temp table tt_params as
 select
-     date '2025-01-01'           as date_from      -- проекты, созданные с
+     date '2026-01-01'           as date_from      -- проекты, созданные с
     ,current_date                as date_to        -- и до (не включая): по текущую дату, период режется в сводных
     ,60                          as purchase_days  -- окно покупок от создания проекта, дней
     ,60                          as transfer_days_win  -- окно передачи для доли побед = окну покупок («Факт покупки на рынке 60 дней»), дней
     ,120                         as transfer_days  -- окно передачи (прямой и через перезаведённый проект), дней
-    ,5                           as our_stage_id   -- safo."Projects_Status"."StageId" этапа анализа / ОУР
     ,30                          as meet_event     -- cwc: «Задача МОП (ЦУЗ) - встреча»
     ,interval '3 hours'          as utc_to_msk
 ;
@@ -55,6 +51,12 @@ with ba as (
         ,b."TaskId"
         ,b."TaskCreatedAt"
         ,t.payload_type
+        ,case when lc."type" = 1               then 'Исходящие'
+              when lc."type" = 2               then 'Звонки'
+              when lc."type" = 3 and t.campaign = 390 then 'Поставщики'
+              when lc."type" = 3 and t.campaign = 508 then 'Банк'
+              when lc."type" = 3               then 'Заявки'
+         end                                               as "Канал норматив"
         ,case lc."type"
               when 1 then 'Исходящий'
               when 2 then 'Входящий звонок'
@@ -76,8 +78,8 @@ with ba as (
         on lc.id = t.campaign
     cross join tt_params p
     where b."ProjectId" is not null
-      and lc."type" in (1, 2, 3)                          -- 1 исходящий, 2 звонки, 3 заявки
-      and t.payload_type is distinct from 'partners'      -- без поставщиков
+      and (   (lc."type" = 1 and t.payload_type is distinct from 'partners')   -- исходящие без поставщиков
+           or  lc."type" in (2, 3) )                                         -- входящие: звонки, заявки, поставщики, банк
       and b."Prj_CreatedAt" >= p.date_from - interval '1 day'
 )
 ,first_task as (
@@ -86,6 +88,7 @@ with ba as (
         ,payload_type
         ,"Канал"
         ,"Канал детально"
+        ,"Канал норматив"
         ,"ЦД МОП"
         ,"Дивизион по МОП"
         ,"Повторный по ГК"
@@ -113,6 +116,7 @@ select
      ) then 1 else 0 end                                   as "Есть задача поставщиков"
     ,ft."Канал"
     ,ft."Канал детально"
+    ,ft."Канал норматив"
     ,ft."ЦД МОП"
     ,ft."Дивизион по МОП"
     ,ft."Повторный по ГК"
@@ -141,6 +145,7 @@ select
     ,d."Есть задача поставщиков"
     ,d."Канал"
     ,d."Канал детально"
+    ,d."Канал норматив"
     ,d."ЦД МОП"
     ,d."Дивизион по МОП"
     ,d."Повторный по ГК"
@@ -192,19 +197,6 @@ left join safo."Projects_RejectionReason" rr
     on rr.id = psl."RejectionReasonId"
 where psl."CreatedAt" is not null
 order by psl."ProjectId", psl."CreatedAt" desc
-;
-
-
--- 3.2 Первый вход на этап анализа / ОУР
-drop table if exists tt_our;
-create temp table tt_our as
-select
-     psl."ProjectId"
-    ,min(psl."CreatedAt") as "Дата начала ОУР"
-from tt_psl psl
-cross join tt_params p
-where psl."StageId" = p.our_stage_id
-group by psl."ProjectId"
 ;
 
 
@@ -432,48 +424,34 @@ analyze tt_meet_task_proj;
 
 
 --================================================================
--- 7. Привязка встреч к проекту ДКС (ПО ПРОЕКТУ: только встречи, привязанные к проекту, в окне проекта)
---    Окно «до ОУР»:     [создание проекта; первый вход на ОУР)
---                       если ОУР не было — до архива / по сей день
---    Окно «в принципе»: [создание проекта; архив / первая передача + 1 день / сегодня]
+-- 7. Встречи по проекту в период жизни проекта
+--    Окно: [создание проекта; архив / первая передача + 1 день / сегодня]
 --================================================================
 drop table if exists tt_meet;
 create temp table tt_meet as
 with w as (
     select
          tp."Номер проекта"
-        ,tp."CtaRepositoryId"
         ,tp."Дата создания проекта"
-        ,o."Дата начала ОУР"
         ,case when tp."Этап" = 'Архив' then ls."Последняя дата работы над проектом" end as archive_dt
         ,tr."Дата первой передачи"
     from tt_projects tp
-    left join tt_our o
-        on o."ProjectId" = tp."Номер проекта"
-    left join tt_last_status ls
-        on ls."ProjectId" = tp."Номер проекта"
-    left join tt_transfer tr
-        on tr."Номер проекта" = tp."Номер проекта"
+    left join tt_last_status ls on ls."ProjectId" = tp."Номер проекта"
+    left join tt_transfer tr    on tr."Номер проекта" = tp."Номер проекта"
 )
 select
      w."Номер проекта"
-    ,count(*) filter (
-        where m.meet_dt < coalesce(w."Дата начала ОУР", w.archive_dt, 'infinity'::timestamp)
-     ) as "Кол-во встреч до ОУР"
-    ,min(m.meet_dt) filter (
-        where m.meet_dt < coalesce(w."Дата начала ОУР", w.archive_dt, 'infinity'::timestamp)
-     ) as "Дата первой встречи до ОУР"
-    ,count(*) filter (
-        where m.meet_dt <= coalesce(w.archive_dt,
-                                    w."Дата первой передачи" + interval '1 day',
-                                    'infinity'::timestamp)
-     ) as "Кол-во встреч всего"
+    ,count(*)        as "Кол-во встреч"
+    ,min(m.meet_dt)  as "Дата первой встречи"
 from w
 join tt_meet_task_proj tpj
     on tpj."ProjectId" = w."Номер проекта"
 join tt_meet_raw m
     on m.event_id = tpj.event_id
    and m.meet_dt >= w."Дата создания проекта"
+   and m.meet_dt <= coalesce(w.archive_dt,
+                             w."Дата первой передачи" + interval '1 day',
+                             'infinity'::timestamp)
 group by w."Номер проекта"
 ;
 
@@ -494,6 +472,44 @@ from voipclient.leasing_interaction li
 join tt_projects tp
     on tp."Номер проекта" = li.project_id
 order by li.project_id, li.started
+;
+
+
+--================================================================
+-- 8.1 Оператор ДКС, заведший проект: первая итерация с проектом (не бот)
+--     Кадры — запись, действующая на момент итерации (как в «Метрики_МПП_ДКС»)
+--================================================================
+drop table if exists tt_operator;
+create temp table tt_operator as
+with fi as (
+    select distinct on (li.project_id)
+         li.project_id
+        ,li.operator
+        ,li.started
+    from voipclient.leasing_interaction li
+    join tt_projects tp
+        on tp."Номер проекта" = li.project_id
+    where li.operator is distinct from 1                 -- 1 = бот-автодозвон
+    order by li.project_id, li.started
+)
+select
+     fi.project_id
+    ,op.login                                                         as "Логин оператора ДКС"
+    ,concat_ws(' ', op.last_name, op.first_name, op.second_name)      as "ФИО оператора ДКС"
+    ,s."Должность"                                                    as "Должность оператора ДКС"
+    ,s."Подразделение"                                                as "Подразделение оператора ДКС"
+from fi
+left join voipclient.configuration_operator op
+    on op.id = fi.operator
+left join lateral (
+    select s.*
+    from dwh."Сотрудники" s
+    where s."Логин" = op.login
+      and fi.started >= s."DateFrom"
+      and fi.started <  s."DateTo"
+    order by s."DateFrom" desc
+    limit 1
+) s on true
 ;
 
 
@@ -528,31 +544,29 @@ select
     ,tp."Возвращен в КЦ"
     ,tp."Канал"
     ,tp."Канал детально"
+    ,tp."Канал норматив"                                                            -- Исходящие / Звонки / Заявки / Поставщики / Банк
+    ,op."Логин оператора ДКС"
+    ,op."ФИО оператора ДКС"
+    ,op."Должность оператора ДКС"
+    ,op."Подразделение оператора ДКС"
     ,tp."Тип задачи (payload_type)"
     ,tp."Есть задача поставщиков"
     ,tp."Повторный по ГК"                                                           as "Повторный клиент по ЮЛ/ГК"
     ,case when coalesce(pu."ЕП", 0) > 0 or coalesce(pu."не ЕП", 0) > 0 then 1 else 0 end as "Факт покупки на рынке 60 дней"   -- клиент купил ТС на рынке (включая ЕП) за 60 дней от создания проекта
-    -- встречи
-    ,case when o."ProjectId" is not null then 1 else 0 end                          as "Был передан на ОУР"
-    ,o."Дата начала ОУР"::date                                                     as "Дата начала ОУР"
-    ,case when o."ProjectId" is not null and coalesce(mt."Кол-во встреч до ОУР", 0) > 0
-          then 1 else 0 end                                                         as "Встреча до ОУР"
-    ,case when o."ProjectId" is null and coalesce(mt."Кол-во встреч до ОУР", 0) > 0
-          then 1 else 0 end                                                         as "Встреча без ОУР и передачи"
-    ,case when coalesce(mt."Кол-во встреч до ОУР", 0) > 0 then 1 else 0 end         as "Встреча актуальная"  -- проведена до ОУР (продающая)
-    ,case when coalesce(mt."Кол-во встреч всего", 0) > 0 then 1 else 0 end          as "Встреча в принципе"
-    ,coalesce(mt."Кол-во встреч до ОУР", 0)                                         as "Кол-во встреч до ОУР"
-    ,mt."Дата первой встречи до ОУР"::date                                         as "Дата первой встречи до ОУР"
+    -- встречи (по проекту, в период жизни проекта)
+    ,case when coalesce(mt."Кол-во встреч", 0) > 0 then 1 else 0 end                as "Встреча актуальная"
+    ,coalesce(mt."Кол-во встреч", 0)                                                as "Кол-во встреч"
+    ,mt."Дата первой встречи"::date                                                as "Дата первой встречи"
     ,tp."Встреча назначена"
     ,rs."reasonProjectWithoutMeet"
     ,1                                                                              as "Проект"
 from tt_projects tp
 left join tt_last_status ls on ls."ProjectId"     = tp."Номер проекта"
-left join tt_our o          on o."ProjectId"      = tp."Номер проекта"
 left join tt_transfer tr    on tr."Номер проекта" = tp."Номер проекта"
 left join tt_purchases pu   on pu."Номер проекта" = tp."Номер проекта"
 left join tt_meet mt        on mt."Номер проекта" = tp."Номер проекта"
 left join tt_reason rs      on rs.project_id      = tp."Номер проекта"
 left join tt_mop mp         on mp."ProjectId"     = tp."Номер проекта"
+left join tt_operator op    on op.project_id      = tp."Номер проекта"
 order by tp."Дата создания проекта"
 ;
