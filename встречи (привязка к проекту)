@@ -29,7 +29,7 @@
 drop table if exists tt_params;
 create temp table tt_params as
 select
-     date '2026-01-01'           as date_from      -- проекты, созданные с
+     date '2025-09-01'           as date_from      -- проекты, созданные с
     ,current_date                as date_to        -- и до (не включая): по текущую дату, период режется в сводных
     ,60                          as purchase_days  -- окно покупок от создания проекта, дней
     ,60                          as transfer_days_win  -- окно передачи для доли побед = окну покупок («Факт покупки на рынке 60 дней»), дней
